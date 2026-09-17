@@ -1,0 +1,240 @@
+// avrobinary_tests.nv — zigzag varints, blocks, the value type, and
+// the bounds a decode is held to.
+//
+// RED ON PURPOSE: every assertion reaches `not implemented:
+// avro-nv.<module>.<fn>`.
+
+use std.test
+use std.bytes
+use avrobinary
+use avroerror
+use avroschema
+use avrovalue
+
+@test
+fn test_zigzag_is_why_minus_one_is_one_byte() [io]
+    test.case("zigzag folds the sign into the low bit")
+    test.assert(avrobinary.zigzag(0) == 0)
+    test.assert(avrobinary.zigzag(-1) == 1)
+    test.assert(avrobinary.zigzag(1) == 2)
+    test.assert(avrobinary.zigzag(-2) == 3)
+
+    test.case("and it undoes exactly")
+    test.assert(avrobinary.unzigzag(avrobinary.zigzag(-1234)) == -1234)
+    test.assert(avrobinary.unzigzag(1) == -1)
+
+    test.case("so -1 costs one byte and not ten")
+    test.assert(avrobinary.long_bytes(-1) == 1)
+    test.assert(avrobinary.long_bytes(0) == 1)
+    test.assert(avrobinary.long_bytes(64) == 2)
+
+@test
+fn test_a_long_reads_and_writes_through_a_value_cursor() [io]
+    // A record of twenty fields is twenty of these, so the cursor
+    // allocates nothing.
+    test.case("a fresh cursor is at its offset and clean")
+    let c = avrobinary.cursor(0)
+    test.assert(c.at == 0 and c.ok)
+    test.assert(c.fault == avrobinary.AVRO_CURSOR_OK)
+
+    test.case("a read answers the value and the cursor after it")
+    let r = avrobinary.read_long(bytes.zeros(1), avrobinary.cursor(0))
+    test.assert(r.value == 0)
+    test.assert(r.cursor.at == 1)
+
+    test.case("running out of bytes sets the flag rather than allocating")
+    let empty = avrobinary.read_long(bytes.zeros(0), avrobinary.cursor(0))
+    test.assert(not empty.cursor.ok)
+    test.assert(empty.cursor.fault == avrobinary.AVRO_CURSOR_TRUNCATED)
+
+    test.case("and the flag turns into the fault the package speaks")
+    match avrobinary.fault_of(empty.cursor, 0)
+        Some(f) => test.assert(avroerror.is_incomplete(f.kind))
+        None    => test.fail("the cursor ran out of bytes")
+
+    test.case("the four cursor codes are distinct")
+    test.assert(avrobinary.AVRO_CURSOR_BAD_VARINT == 2)
+    test.assert(avrobinary.AVRO_CURSOR_NEGATIVE_LENGTH == 3)
+    test.assert(avrobinary.AVRO_CURSOR_LIMIT == 4)
+
+    test.case("writing goes into the caller's buffer")
+    match avrobinary.write_long(-1, bytes.zeros(10), 0)
+        Ok(n)  => test.assert(n == 1)
+        Err(_) => test.fail("ten bytes is room for any long")
+
+    test.case("and a buffer with no room is refused rather than grown")
+    match avrobinary.write_long(-1, bytes.zeros(0), 0)
+        Ok(_)  => test.fail("zero bytes is no room at all")
+        Err(f) => test.assert(avroerror.is_limit(f.kind))
+
+@test
+fn test_the_length_limit_is_the_only_protection_a_caller_has() [io]
+    // A `bytes` length is a varint, so five bytes of input can declare
+    // two gigabytes.
+    test.case("the default bounds are bounded, because the usual input is somebody else's")
+    let d = avrobinary.default_limits()
+    test.assert(d.max_length == 67108864)
+    test.assert(d.max_items == 16777216)
+    test.assert(d.max_depth == 64)
+
+    test.case("and a caller decoding what it wrote can turn them off")
+    let n = avrobinary.no_limits()
+    test.assert(n.max_length == -1 and n.max_items == -1)
+
+    test.case("a bound reached is not the same thing as a damaged file")
+    test.assert(avroerror.is_limit(AvroLengthLimitReached(2000000000, 67108864)))
+    test.assert(not avroerror.is_corrupt(AvroLengthLimitReached(2000000000, 67108864)))
+
+@test
+fn test_a_negative_block_count_means_a_byte_size_follows() [io]
+    // The part of the format a port forgets until it meets a file
+    // that uses it — and it is what makes a large array skippable.
+    test.case("a block header answers a non-negative count")
+    let b = avrobinary.read_block_header(bytes.zeros(1), avrobinary.cursor(0))
+    test.assert(b.count == 0)
+
+    test.case("and a byte size only where the writer declared one")
+    test.assert(b.byte_size == -1)
+    test.assert(b.cursor.at == 1)
+
+@test
+fn test_skipping_a_field_costs_a_skip_and_not_a_decode() [io]
+    // Reading three fields out of a forty-field record should cost
+    // three fields' work plus thirty-seven skips.
+    test.case("a long skips in the bytes it occupies")
+    match avroschema.parse("\"long\"")
+        Ok(s)  =>
+            let c = avrobinary.skip(bytes.zeros(4), avrobinary.cursor(0), s,
+                                    avrobinary.default_limits())
+            test.assert(c.at == 1)
+        Err(_) => test.fail("\"long\" is a schema")
+
+    test.case("and a null skips nothing at all, because it is zero bytes")
+    match avroschema.parse("\"null\"")
+        Ok(s)  =>
+            let c = avrobinary.skip(bytes.zeros(4), avrobinary.cursor(0), s,
+                                    avrobinary.default_limits())
+            test.assert(c.at == 0)
+        Err(_) => test.fail("\"null\" is a schema")
+
+@test
+fn test_a_value_remembers_what_the_schema_distinguishes() [io]
+    // A JSON value would throw six distinctions away.
+    test.case("int and long are different values with different encodings")
+    test.assert(avrovalue.kind_name(avrovalue.long_value(7)) == "long")
+    test.assert(avrovalue.kind_name(AvroIntValue(7)) == "int")
+
+    test.case("bytes and string are different although they encode alike")
+    test.assert(avrovalue.kind_name(avrovalue.str_value("x")) == "string")
+    test.assert(avrovalue.kind_name(AvroBytesValue(bytes.zeros(1))) == "bytes")
+
+    test.case("an enum is an INDEX, because the index is the encoding")
+    test.assert(avrovalue.kind_name(AvroEnumValue(2)) == "enum")
+
+    test.case("and a union remembers which branch it came from")
+    let u = avrovalue.union_value(1, avrovalue.str_value("hello"))
+    test.assert(avrovalue.kind_name(u) == "union")
+    match avrovalue.union_inner(u)
+        Some(v) => test.assert(avrovalue.kind_name(v) == "string")
+        None    => test.fail("a union has an inner value")
+
+    test.case("a value that is not a union has no inner value")
+    match avrovalue.union_inner(avrovalue.long_value(1))
+        Some(_) => test.fail("a long is not a union")
+        None    => test.assert(true)
+
+@test
+fn test_a_writer_checks_its_value_against_its_schema_first() [io]
+    // Avro's encoding has no markers, so a value that did not fit
+    // would be written as bytes nobody can read back.
+    test.case("a long value fits a long schema")
+    match avroschema.parse("\"long\"")
+        Ok(s)  =>
+            match avrovalue.check(avrovalue.long_value(7), s)
+                Ok(_)  => test.assert(true)
+                Err(_) => test.fail("a long fits a long")
+        Err(_) => test.fail("\"long\" is a schema")
+
+    test.case("a string value does not")
+    match avroschema.parse("\"long\"")
+        Ok(s)  =>
+            match avrovalue.check(avrovalue.str_value("x"), s)
+                Ok(_)  => test.fail("a string does not fit a long")
+                Err(f) => test.assert(avroerror.is_schema_error(f.kind))
+        Err(_) => test.fail("\"long\" is a schema")
+
+    test.case("records and maps are read by name, which needs the schema")
+    match avroschema.parse("\"long\"")
+        Ok(s)  =>
+            match avrovalue.field_of(avrovalue.long_value(1), s, "id")
+                Some(_) => test.fail("a long has no fields")
+                None    => test.assert(true)
+        Err(_) => test.fail("\"long\" is a schema")
+    match avrovalue.map_get(avrovalue.long_value(1), "k")
+        Some(_) => test.fail("a long is not a map")
+        None    => test.assert(true)
+
+@test
+fn test_the_two_json_encodings_are_not_the_same_encoding() [io]
+    // A default's JSON and a datum's JSON differ on unions and on
+    // bytes, and both are traps.
+    test.case("a datum's JSON round-trips")
+    match avroschema.parse("\"long\"")
+        Ok(s)  =>
+            match avrovalue.to_json(avrovalue.long_value(7), s)
+                Ok(j)  =>
+                    match avrovalue.from_json(j, s)
+                        Ok(v)  => test.assert(avrovalue.kind_name(v) == "long")
+                        Err(_) => test.fail("it round-trips")
+                Err(_) => test.fail("a long has a JSON encoding")
+        Err(_) => test.fail("\"long\" is a schema")
+
+    test.case("and a default's JSON is read by its own rules")
+    match avroschema.parse("\"long\"")
+        Ok(s)  =>
+            match avrovalue.from_default_json("0", s)
+                Ok(v)  => test.assert(avrovalue.kind_name(v) == "long")
+                Err(_) => test.fail("0 is a long default")
+        Err(_) => test.fail("\"long\" is a schema")
+
+@test
+fn test_the_sort_order_is_the_specifications_and_not_the_obvious_one() [io]
+    test.case("longs compare by value")
+    match avroschema.parse("\"long\"")
+        Ok(s)  =>
+            test.assert(avrovalue.compare(avrovalue.long_value(1),
+                                          avrovalue.long_value(2), s) < 0)
+            test.assert(avrovalue.compare(avrovalue.long_value(2),
+                                          avrovalue.long_value(2), s) == 0)
+        Err(_) => test.fail("\"long\" is a schema")
+
+@test
+fn test_the_whole_value_entry_points_size_and_encode() [io]
+    test.case("a datum's size is answered before anything is written")
+    match avroschema.parse("\"long\"")
+        Ok(s)  =>
+            match avrobinary.encoded_bytes(avrovalue.long_value(7), s)
+                Ok(n)  => test.assert(n == 1)
+                Err(_) => test.fail("7 encodes in one byte")
+        Err(_) => test.fail("\"long\" is a schema")
+
+    test.case("encoding allocates, and encoding into a buffer does not")
+    match avroschema.parse("\"long\"")
+        Ok(s)  =>
+            match avrobinary.encode(avrovalue.long_value(7), s)
+                Ok(b)  => test.assert(bytes.len(b) == 1)
+                Err(_) => test.fail("7 encodes")
+            match avrobinary.encode_into(avrovalue.long_value(7), s,
+                                         bytes.zeros(16), 0)
+                Ok(n)  => test.assert(n == 1)
+                Err(_) => test.fail("sixteen bytes is room")
+        Err(_) => test.fail("\"long\" is a schema")
+
+    test.case("and decoding takes the bounds rather than inventing one")
+    match avroschema.parse("\"long\"")
+        Ok(s)  =>
+            match avrobinary.decode(bytes.zeros(1), 0, s,
+                                    avrobinary.default_limits())
+                Ok(v)  => test.assert(avrovalue.kind_name(v) == "long")
+                Err(_) => test.fail("one zero byte is the long 0")
+        Err(_) => test.fail("\"long\" is a schema")

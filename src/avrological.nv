@@ -1,0 +1,312 @@
+// avrological.nv — logical types: an annotation on an ordinary type
+// that says what the bytes MEAN, and which a reader may ignore.
+//
+// Every body is a `todo()`.  The signatures are the design, and the
+// compiler checks them as claims; see the README for the stamp.
+//
+// A LOGICAL TYPE DOES NOT CHANGE THE ENCODING.  `{"type":"long",
+// "logicalType":"timestamp-millis"}` is written and read as a `long`;
+// the annotation says the number is milliseconds since the Unix epoch.
+// That is what makes logical types safe to add to a schema: a reader
+// that has never heard of `timestamp-millis` still reads the field,
+// as a `long`.
+//
+// AND THE SPECIFICATION REQUIRES A READER TO IGNORE AN UNUSABLE ONE.
+// If an annotation does not fit its underlying type — a `decimal`
+// whose precision is larger than its `fixed` can hold, a `duration` on
+// something that is not a 12-byte `fixed` — the implementation must
+// use the underlying type and carry on.  So `of` answers an
+// `AvroLogical` that may be `AvroNotLogical`, and nothing in this
+// module raises a fault at decode time.  `check` is the separate call
+// for a caller that wants to be TOLD, at schema-review time, that an
+// annotation it wrote is being ignored.
+//
+// DECIMAL IS THE ONE WITH A TRAP IN IT.  A decimal is a two's
+// complement big-endian integer, and its `scale` says where the point
+// goes: the value is `unscaled / 10^scale`.  On a `fixed` the byte
+// count is the fixed's size and the precision must fit in it; on
+// `bytes` the length is whatever the writer wrote.  A reader that
+// treated the bytes as unsigned reads every negative number wrong, and
+// a reader that ignored `scale` is wrong by a factor of a thousand.
+//
+// DURATION IS NOT A NUMBER.  It is a 12-byte `fixed` holding three
+// unsigned 32-bit LITTLE-endian counts: months, days, milliseconds.
+// It is the only logical type in the specification that is
+// little-endian, and the only one that cannot be compared without
+// knowing a calendar.
+
+use avroerror
+use avroschema
+
+// Which logical type an annotation names.
+//
+// ```novo
+// use avrological
+//
+// fn main() [io]
+//     println(avrological.logical_name(AvroDate))
+// ```
+pub enum AvroLogical
+    // No annotation, or one this build does not know.  The ordinary
+    // answer, and not an error.
+    AvroNotLogical
+    // `decimal` on `bytes` or `fixed`: a two's complement big-endian
+    // unscaled integer, divided by `10^scale`.
+    AvroDecimal
+    // `uuid` on `string`, or on a 16-byte `fixed`.
+    AvroUuid
+    // `date` on `int`: days since 1970-01-01.
+    AvroDate
+    // `time-millis` on `int`: milliseconds after midnight.
+    AvroTimeMillis
+    // `time-micros` on `long`: microseconds after midnight.
+    AvroTimeMicros
+    // `timestamp-millis` on `long`: milliseconds since the Unix epoch,
+    // UTC.
+    AvroTimestampMillis
+    // `timestamp-micros` on `long`: microseconds since the Unix epoch,
+    // UTC.
+    AvroTimestampMicros
+    // `timestamp-nanos` on `long`: nanoseconds since the Unix epoch,
+    // UTC.
+    AvroTimestampNanos
+    // `local-timestamp-millis` on `long`: milliseconds since
+    // 1970-01-01T00:00:00 in an unspecified local zone.
+    //
+    // NOT the same as `timestamp-millis`, and the difference is not
+    // visible in the bytes: one is an instant and the other is a wall
+    // clock reading with no zone attached.  A reader that confused
+    // them is wrong by however far the writer was from UTC.
+    AvroLocalTimestampMillis
+    // `local-timestamp-micros` on `long`.
+    AvroLocalTimestampMicros
+    // `local-timestamp-nanos` on `long`.
+    AvroLocalTimestampNanos
+    // `duration` on a 12-byte `fixed`: three unsigned 32-bit
+    // LITTLE-endian counts — months, days, milliseconds.
+    AvroDuration
+
+// The specification's name for a logical type: `"decimal"`, `"uuid"`,
+// `"timestamp-millis"`.  `""` for `AvroNotLogical`.
+//
+// ```novo
+// use avrological
+//
+// fn main() [io]
+//     println(avrological.logical_name(AvroTimestampMicros))
+// ```
+pub fn logical_name(l: AvroLogical) -> Str []
+    todo("avro-nv.avrological.logical_name")
+
+// The logical type a schema's annotation names, IGNORING one that does
+// not fit.
+//
+// `AvroNotLogical` for a schema with no annotation, for an annotation
+// this build does not know, and for one that does not fit its
+// underlying type — which is what the specification requires: an
+// unusable annotation is ignored and the underlying type is used.
+//
+// Never fails.  `check` is the call for a caller that wants to be told
+// its annotation is being ignored.
+//
+// ```novo
+// use avrological
+// use avroschema
+//
+// fn main() [io]
+//     match avroschema.parse("{\"type\":\"int\",\"logicalType\":\"date\"}")
+//         Ok(s)  => println(avrological.logical_name(avrological.of(s)))
+//         Err(e) => println(e.message())
+// ```
+pub fn of(s: AvroSchema) -> AvroLogical []
+    todo("avro-nv.avrological.of")
+
+// Whether a schema carries an annotation that is being IGNORED.
+//
+// `AvroBadLogicalType` naming the annotation, which
+// `avroerror.is_schema_error` calls a developer's problem.  The call a
+// schema review makes, not one a decoder makes: silently using the underlying
+// type is correct behaviour and also exactly how a `decimal` with the
+// wrong precision becomes a pile of bytes nobody notices.
+//
+// ```novo
+// use avrological
+// use avroschema
+//
+// fn main() [io]
+//     match avroschema.parse("{\"type\":\"int\",\"logicalType\":\"date\"}")
+//         Ok(s) =>
+//             match avrological.check(s)
+//                 Ok(_)  => println("the annotation fits")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn check(s: AvroSchema) -> Result<AvroLogical, AvroFault> []
+    todo("avro-nv.avrological.check")
+
+// Which underlying type a logical type must sit on.
+//
+// `AvroBytes` for `decimal` — `fixed` is the other legal one and
+// `fits` is the call that accepts both — `AvroString` for `uuid`,
+// `AvroInt` for `date` and `time-millis`, `AvroLong` for the rest,
+// `AvroFixed` for `duration`.
+//
+// ```novo
+// use avrological
+// use avroschema
+//
+// fn main() [io]
+//     println(avroschema.type_name(avrological.underlying(AvroDate)))
+// ```
+pub fn underlying(l: AvroLogical) -> AvroType []
+    todo("avro-nv.avrological.underlying")
+
+// Whether an annotation fits a schema.
+//
+// `decimal` fits `bytes` and `fixed`, and on a `fixed` only when the
+// precision fits in the fixed's bytes; `uuid` fits `string` and a
+// 16-byte `fixed`; `duration` fits only a 12-byte `fixed`; the rest
+// fit exactly one primitive.  A `decimal` also needs
+// `0 < scale <= precision`.
+//
+// ```novo
+// use avrological
+// use avroschema
+//
+// fn main() [io]
+//     match avroschema.parse("\"int\"")
+//         Ok(s)  => println("${avrological.fits(AvroDate, s)}")
+//         Err(e) => println(e.message())
+// ```
+pub fn fits(l: AvroLogical, s: AvroSchema) -> Bool []
+    todo("avro-nv.avrological.fits")
+
+// The fewest bytes a `fixed` needs to hold a decimal of `precision`
+// digits.
+//
+// `ceil((precision * log2(10) + 1) / 8)`, which is the
+// specification's own formula and the number a schema author gets
+// wrong by one.
+//
+// `AvroBadParameter` for a precision below 1.
+//
+// ```novo
+// use avrological
+//
+// fn main() [io]
+//     match avrological.decimal_fixed_bytes(18)
+//         Ok(n)  => println("${n}")
+//         Err(e) => println(e.message())
+// ```
+pub fn decimal_fixed_bytes(precision: Int) -> Result<Int, AvroFault> []
+    todo("avro-nv.avrological.decimal_fixed_bytes")
+
+// The unscaled integer a decimal's bytes hold.
+//
+// TWO'S COMPLEMENT, BIG-ENDIAN, and signed.  A reader that treated
+// them as unsigned reads every negative number wrong, which is the
+// mistake this function exists to make unwritable.
+//
+// `AvroLengthLimitReached` when the bytes hold more than a 64-bit
+// integer can, because this package does not carry a big integer and
+// says so rather than truncating.
+//
+// ```novo
+// use std.bytes
+// use avrological
+//
+// fn main() [io]
+//     match avrological.decimal_unscaled(bytes.zeros(4))
+//         Ok(n)  => println("${n}")
+//         Err(e) => println(e.message())
+// ```
+pub fn decimal_unscaled(data: Bytes) -> Result<Int, AvroFault> []
+    todo("avro-nv.avrological.decimal_unscaled")
+
+// The bytes an unscaled integer encodes to, in the fewest that hold
+// it.
+//
+// ```novo
+// use std.bytes
+// use avrological
+//
+// fn main() [io]
+//     match avrological.decimal_bytes(-1234)
+//         Ok(b)  => println("${bytes.len(b)}")
+//         Err(e) => println(e.message())
+// ```
+pub fn decimal_bytes(unscaled: Int) -> Result<Bytes, AvroFault> []
+    todo("avro-nv.avrological.decimal_bytes")
+
+// A `duration`'s three counts, from its twelve bytes.
+//
+// ```novo
+// use std.bytes
+// use avrological
+//
+// fn main() [io]
+//     match avrological.duration_of(bytes.zeros(12))
+//         Ok(d)  => println("${d.months}")
+//         Err(e) => println(e.message())
+// ```
+pub struct AvroDurationValue
+    // Whole months.
+    months: Int
+    // Whole days.
+    days: Int
+    // Milliseconds.
+    millis: Int
+
+// Read a `duration` from its twelve bytes.
+//
+// Three unsigned 32-bit LITTLE-endian counts.  The only little-endian
+// logical type in the specification, which is why this is a function
+// and not three inline reads.
+//
+// `AvroBufferTooSmall` for fewer than twelve bytes.
+//
+// ```novo
+// use std.bytes
+// use avrological
+//
+// fn main() [io]
+//     match avrological.duration_of(bytes.zeros(12))
+//         Ok(d)  => println("${d.millis}")
+//         Err(e) => println(e.message())
+// ```
+pub fn duration_of(data: Bytes) -> Result<AvroDurationValue, AvroFault> []
+    todo("avro-nv.avrological.duration_of")
+
+// The twelve bytes a duration encodes to.
+//
+// `AvroBadParameter` for a negative count, which the unsigned fields
+// cannot hold.
+//
+// ```novo
+// use std.bytes
+// use avrological
+//
+// fn main() [io]
+//     match avrological.duration_bytes(1, 2, 3)
+//         Ok(b)  => println("${bytes.len(b)}")
+//         Err(e) => println(e.message())
+// ```
+pub fn duration_bytes(months: Int, days: Int, millis: Int) -> Result<Bytes, AvroFault> []
+    todo("avro-nv.avrological.duration_bytes")
+
+// Whether a logical type is a point in time with a zone (UTC) rather
+// than a wall clock reading with none.
+//
+// True for the three `timestamp-*`, false for the three
+// `local-timestamp-*`.  THE DISTINCTION THAT IS NOT VISIBLE IN THE
+// BYTES: both are a `long` of the same magnitude, and a reader that
+// confused them is wrong by however far the writer was from UTC.
+//
+// ```novo
+// use avrological
+//
+// fn main() [io]
+//     println("${avrological.is_instant(AvroTimestampMillis)}")
+// ```
+pub fn is_instant(l: AvroLogical) -> Bool []
+    todo("avro-nv.avrological.is_instant")

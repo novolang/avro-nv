@@ -1,0 +1,480 @@
+// avroschema.nv — the schema language: eight primitives, six complex
+// types, and the naming rules that make two schemas comparable.
+//
+// Every body is a `todo()`.  The signatures are the design, and the
+// compiler checks them as claims; see the README for the stamp.
+//
+// AN AVRO SCHEMA IS JSON, and it is the only self-description the data
+// has.  The binary encoding carries no field tags, no lengths on a
+// record and no terminators, so the schema is not documentation — it
+// is the parser.  Everything in this module exists so that the schema
+// is a VALUE, parsed once and checked once, rather than a string a
+// decoder re-reads per record.
+//
+// EIGHT PRIMITIVES: null, boolean, int, long, float, double, bytes,
+// string.  `int` and `long` are 32- and 64-bit signed; `bytes` and
+// `string` differ only in whether the bytes are meant as UTF-8, and
+// they are encoded identically.
+//
+// SIX COMPLEX TYPES: record, enum, array, map, union, fixed.  Three of
+// them — record, enum and fixed — are NAMED, and a name is the thing
+// two schemas are matched by when a reader and a writer are resolved.
+//
+// A FULL NAME IS A NAMESPACE AND A NAME, and the rules for producing
+// one are the part of the specification everybody gets wrong.  A name
+// containing a dot is already a full name and its namespace attribute
+// is IGNORED.  Otherwise the namespace attribute applies.  Otherwise
+// the enclosing schema's namespace applies — and "enclosing" means the
+// nearest enclosing NAMED type, not the nearest enclosing schema, so a
+// record inside an array inside a record inherits from the record.
+// `full_name_in` is that rule written once.
+//
+// A UNION MAY NOT CONTAIN A UNION, and may not contain the same type
+// twice — except that two named types with different names are
+// different types.  Both rules are checked at parse, because a union
+// that broke either would make the branch index ambiguous and the
+// binary encoding is nothing but that index.
+//
+// THE PARSING CANONICAL FORM IS WHAT A FINGERPRINT IS TAKEN OVER.  It
+// strips everything that does not change how data is read — docs,
+// aliases, defaults, and every attribute the specification does not
+// name — resolves every name to its full name, and puts the remaining
+// attributes in a fixed order.  Two schemas with the same canonical
+// form read the same bytes the same way, and that is the whole basis
+// of single-object encoding.
+
+use avroerror
+
+// Which of the fourteen types a schema is.
+//
+// Prefixed, because a variant is constructed by NAME across a whole
+// program and `Record`, `Array`, `Map` and `Union` are names four
+// other packages will want.
+//
+// ```novo
+// use avroschema
+//
+// fn main() [io]
+//     println(avroschema.type_name(AvroLong))
+// ```
+pub enum AvroType
+    // The null type: one value, and zero bytes on the wire.
+    AvroNull
+    // A boolean: one byte, 0 or 1.
+    AvroBoolean
+    // A 32-bit signed integer, zigzag variable-length encoded.
+    AvroInt
+    // A 64-bit signed integer, zigzag variable-length encoded.
+    AvroLong
+    // A 32-bit IEEE 754 float, four bytes, little-endian.
+    AvroFloat
+    // A 64-bit IEEE 754 double, eight bytes, little-endian.
+    AvroDouble
+    // A length-prefixed byte sequence.
+    AvroBytes
+    // A length-prefixed byte sequence meant as UTF-8.  Encoded
+    // identically to `AvroBytes`, which is why a reader and a writer
+    // may resolve one to the other.
+    AvroString
+    // A named product type: an ordered list of fields, encoded as
+    // their encodings concatenated with nothing between them.
+    AvroRecord
+    // A named list of symbols, encoded as the symbol's index.
+    AvroEnum
+    // A repeated value, encoded in blocks.
+    AvroArray
+    // A string-keyed map, encoded in blocks like an array.
+    AvroMap
+    // A choice between two or more schemas, encoded as the branch
+    // index and then that branch.
+    AvroUnion
+    // A named fixed-length byte sequence, with no length prefix.
+    AvroFixed
+
+// One field of a record.
+//
+// ```novo
+// use avroschema
+//
+// fn main() [io]
+//     match avroschema.parse("\"long\"")
+//         Ok(s)  =>
+//             let f = avroschema.field("id", s)
+//             println(f.name)
+//         Err(e) => println(e.message())
+// ```
+pub struct AvroField
+    // The field's name.  Unique within its record.
+    name: Str
+    // The field's schema.
+    schema: AvroSchema
+    // The field's default, as the JSON text the schema carried, or
+    // `""` when it has none.
+    //
+    // KEPT AS TEXT rather than as a value, because a default is only
+    // ever used through resolution and turning it into a value needs
+    // the READER's schema, which the writer's schema does not have.
+    // `avroresolve` is where it becomes one.
+    default_json: Str
+    // Whether the field carries a default at all.  A field whose
+    // default is JSON `null` has one; the empty string above cannot
+    // tell those apart, so this is the question to ask.
+    has_default: Bool
+    // The field's aliases, which resolution matches a writer's field
+    // name against.
+    aliases: [Str]
+    // The field's `order` attribute: `"ascending"`, `"descending"` or
+    // `"ignore"`.  Carried because it is part of the schema and
+    // affects the specification's sort order, which a caller sorting
+    // Avro data has to honour.
+    order: Str
+
+// A parsed Avro schema.
+//
+// ```novo
+// use avroschema
+//
+// fn main() [io]
+//     match avroschema.parse("\"string\"")
+//         Ok(s)  => println(avroschema.type_name(s.kind))
+//         Err(e) => println(e.message())
+// ```
+pub struct AvroSchema
+    // Which of the fourteen types this is.
+    kind: AvroType
+    // The full name, for `AvroRecord`, `AvroEnum` and `AvroFixed`;
+    // `""` for the rest.  Already resolved against the enclosing
+    // namespace, so a comparison is a string comparison.
+    full_name: Str
+    // The aliases, as full names.  Resolution matches a reader's name
+    // against a writer's name OR any of the writer's aliases.
+    aliases: [Str]
+    // The `doc` attribute, or `""`.  Carried so that a schema can be
+    // written back out, and stripped from the canonical form.
+    doc: Str
+    // The fields, for `AvroRecord`.  Empty otherwise.
+    fields: [AvroField]
+    // The symbols, for `AvroEnum`.  Empty otherwise.  Their ORDER is
+    // the encoding: a symbol is written as its index here.
+    symbols: [Str]
+    // The `default` symbol of an `AvroEnum`, or `""`.
+    //
+    // What a reader falls back to when the writer wrote a symbol the
+    // reader does not have — the one place Avro lets an enum grow
+    // without breaking every existing reader.
+    enum_default: Str
+    // The element schema, for `AvroArray`; the value schema, for
+    // `AvroMap`.  A one-element list, or empty.
+    element: [AvroSchema]
+    // The branches, for `AvroUnion`.  Empty otherwise.  Their ORDER
+    // is the encoding: a branch is written as its index here.
+    branches: [AvroSchema]
+    // The byte count, for `AvroFixed`.  Zero otherwise.
+    fixed_size: Int
+    // The logical-type annotation, or `""` — `"decimal"`, `"uuid"`,
+    // `"date"`, `"timestamp-millis"`.  `avrological` is what turns it
+    // into a checked value.
+    logical: Str
+    // The `precision` of a `decimal`, or 0.
+    precision: Int
+    // The `scale` of a `decimal`, or 0.
+    scale: Int
+
+// Parse a schema from its JSON text.
+//
+// `AvroSchemaNotJson` when the text is not JSON, `AvroUnknownType`
+// when it names a type that is neither a primitive, a complex type nor
+// a name defined earlier, `AvroDuplicateName` for a name defined
+// twice, `AvroBadName` for a name the format does not allow, and
+// `AvroBadDefault` for a field default that does not fit its type.
+// `avroerror.is_schema_error` answers true for every one of them: they
+// are a developer's problem, not a file's.
+//
+// EVERY ONE OF THOSE IS CHECKED HERE, at parse, because a schema is
+// read once and used for millions of records, and because the person
+// who can fix a bad default is the person reading the schema.
+//
+// ```novo
+// use avroschema
+//
+// fn main() [io]
+//     match avroschema.parse("{\"type\":\"array\",\"items\":\"int\"}")
+//         Ok(s)  => println(avroschema.type_name(s.kind))
+//         Err(e) => println(e.message())
+// ```
+pub fn parse(json: Str) -> Result<AvroSchema, AvroFault> []
+    todo("avro-nv.avroschema.parse")
+
+// Parse a schema in the namespace of an enclosing named type.
+//
+// The form `parse` is written in terms of, and the one a caller needs
+// when it is assembling a schema out of pieces that were written to be
+// nested.  `""` is the null namespace.
+//
+// ```novo
+// use avroschema
+//
+// fn main() [io]
+//     match avroschema.parse_in("\"int\"", "com.example")
+//         Ok(s)  => println(avroschema.type_name(s.kind))
+//         Err(e) => println(e.message())
+// ```
+pub fn parse_in(json: Str, namespace: Str) -> Result<AvroSchema, AvroFault> []
+    todo("avro-nv.avroschema.parse_in")
+
+// The schema for one of the eight primitive types.
+//
+// ```novo
+// use avroschema
+//
+// fn main() [io]
+//     println(avroschema.type_name(avroschema.primitive(AvroDouble).kind))
+// ```
+pub fn primitive(t: AvroType) -> AvroSchema []
+    todo("avro-nv.avroschema.primitive")
+
+// The specification's name for a type: `"null"`, `"record"`, `"map"`.
+//
+// ```novo
+// use avroschema
+//
+// fn main() [io]
+//     println(avroschema.type_name(AvroFixed))
+// ```
+pub fn type_name(t: AvroType) -> Str []
+    todo("avro-nv.avroschema.type_name")
+
+// Whether a type is one of the eight primitives.
+//
+// ```novo
+// use avroschema
+//
+// fn main() [io]
+//     println("${avroschema.is_primitive(AvroBytes)}")
+// ```
+pub fn is_primitive(t: AvroType) -> Bool []
+    todo("avro-nv.avroschema.is_primitive")
+
+// Whether a type is named — record, enum or fixed.
+//
+// The predicate the naming rules and the resolution rules are written
+// in: a named type is matched by NAME and an unnamed one is matched by
+// structure.
+//
+// ```novo
+// use avroschema
+//
+// fn main() [io]
+//     println("${avroschema.is_named(AvroRecord)}")
+// ```
+pub fn is_named(t: AvroType) -> Bool []
+    todo("avro-nv.avroschema.is_named")
+
+// The full name a `name` and a `namespace` produce inside an enclosing
+// namespace.
+//
+// THE RULE EVERYBODY GETS WRONG, written once.  A `name` containing a
+// dot is already a full name and `namespace` is IGNORED.  Otherwise
+// `namespace` applies if it is not empty.  Otherwise `enclosing`
+// applies — and "enclosing" means the nearest enclosing NAMED type,
+// not the nearest enclosing schema, so a record inside an array inside
+// a record inherits the record's namespace and not the array's
+// nothing.
+//
+// ```novo
+// use avroschema
+//
+// fn main() [io]
+//     println(avroschema.full_name_in("User", "", "com.example"))
+// ```
+pub fn full_name_in(name: Str, namespace: Str, enclosing: Str) -> Str []
+    todo("avro-nv.avroschema.full_name_in")
+
+// Whether a string is a legal Avro name.
+//
+// It must start with a letter or an underscore and continue with
+// letters, digits and underscores.  A full name is those, separated by
+// dots.
+//
+// ```novo
+// use avroschema
+//
+// fn main() [io]
+//     let legal = avroschema.is_legal_name("9lives")
+//     println("${legal}")
+// ```
+pub fn is_legal_name(name: Str) -> Bool []
+    todo("avro-nv.avroschema.is_legal_name")
+
+// The namespace part of a full name, or `""`.
+//
+// ```novo
+// use avroschema
+//
+// fn main() [io]
+//     println(avroschema.namespace_of("com.example.User"))
+// ```
+pub fn namespace_of(full_name: Str) -> Str []
+    todo("avro-nv.avroschema.namespace_of")
+
+// The field of a record with a given name, or `None`.
+//
+// ```novo
+// use avroschema
+//
+// fn main() [io]
+//     match avroschema.parse("\"int\"")
+//         Ok(s) =>
+//             match avroschema.field_named(s, "id")
+//                 Some(_) => println("found")
+//                 None    => println("an int has no fields")
+//         Err(e) => println(e.message())
+// ```
+pub fn field_named(s: AvroSchema, name: Str) -> ?AvroField []
+    todo("avro-nv.avroschema.field_named")
+
+// A field from a name and a schema, with no default and no aliases.
+//
+// ```novo
+// use avroschema
+//
+// fn main() [io]
+//     match avroschema.parse("\"long\"")
+//         Ok(s)  =>
+//             let f = avroschema.field("id", s)
+//             println("${f.has_default}")
+//         Err(e) => println(e.message())
+// ```
+pub fn field(name: Str, schema: AvroSchema) -> AvroField []
+    todo("avro-nv.avroschema.field")
+
+// The same field with a default, as JSON text.
+//
+// `AvroBadDefault` when the JSON does not fit the field's type — an
+// object for an `int`, a string for a `boolean`, a number outside what
+// the type can hold.
+//
+// ```novo
+// use avroschema
+//
+// fn main() [io]
+//     match avroschema.parse("\"long\"")
+//         Ok(s) =>
+//             match avroschema.with_default(avroschema.field("id", s), "0")
+//                 Ok(f)  => println("${f.has_default}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn with_default(f: AvroField, json: Str) -> Result<AvroField, AvroFault> []
+    todo("avro-nv.avroschema.with_default")
+
+// The index of a symbol in an enum, or `-1`.
+//
+// The encoding is the index, so this is what a writer needs and what
+// resolution compares.
+//
+// ```novo
+// use avroschema
+//
+// fn main() [io]
+//     match avroschema.parse("\"int\"")
+//         Ok(s)  =>
+//             let i = avroschema.symbol_index(s, "RED")
+//             println("${i}")
+//         Err(e) => println(e.message())
+// ```
+pub fn symbol_index(s: AvroSchema, symbol: Str) -> Int []
+    todo("avro-nv.avroschema.symbol_index")
+
+// The branch of a union that a full type name selects, or `-1`.
+//
+// A union is matched by the branch's type name — `"null"`, `"string"`,
+// or a named type's full name — which is also how a JSON-encoded Avro
+// value names its branch.
+//
+// ```novo
+// use avroschema
+//
+// fn main() [io]
+//     match avroschema.parse("[\"null\",\"string\"]")
+//         Ok(s)  =>
+//             let i = avroschema.branch_index(s, "string")
+//             println("${i}")
+//         Err(e) => println(e.message())
+// ```
+pub fn branch_index(s: AvroSchema, type_name: Str) -> Int []
+    todo("avro-nv.avroschema.branch_index")
+
+// Whether a union has a `null` branch, and where.
+//
+// Answers the index or `-1`.  The question every optional field is,
+// and the one a caller mapping Avro onto a language with nullable
+// types asks first.
+//
+// ```novo
+// use avroschema
+//
+// fn main() [io]
+//     match avroschema.parse("[\"null\",\"string\"]")
+//         Ok(s)  => println("${avroschema.null_branch(s)}")
+//         Err(e) => println(e.message())
+// ```
+pub fn null_branch(s: AvroSchema) -> Int []
+    todo("avro-nv.avroschema.null_branch")
+
+// The schema as JSON, in the form it would be written to a file.
+//
+// Keeps the docs, the aliases and the defaults.  `canonical_form` is
+// the one that strips them.
+//
+// ```novo
+// use avroschema
+//
+// fn main() [io]
+//     match avroschema.parse("\"int\"")
+//         Ok(s)  => println(avroschema.to_json(s))
+//         Err(e) => println(e.message())
+// ```
+pub fn to_json(s: AvroSchema) -> Str []
+    todo("avro-nv.avroschema.to_json")
+
+// The Parsing Canonical Form of a schema.
+//
+// Strips everything that does not change how data is read — `doc`,
+// `aliases`, `default`, `order`, and every attribute the
+// specification does not name — resolves every name to its full name,
+// and puts the remaining attributes in the specification's order, with
+// no whitespace.
+//
+// THE BASIS OF EVERY FINGERPRINT.  Two schemas with the same canonical
+// form read the same bytes the same way, which is what makes a
+// fingerprint a usable schema identifier and what makes single-object
+// encoding work.
+//
+// ```novo
+// use avroschema
+//
+// fn main() [io]
+//     match avroschema.parse("{\"type\":\"int\",\"doc\":\"an id\"}")
+//         Ok(s)  => println(avroschema.canonical_form(s))
+//         Err(e) => println(e.message())
+// ```
+pub fn canonical_form(s: AvroSchema) -> Str []
+    todo("avro-nv.avroschema.canonical_form")
+
+// Every named type the schema defines, by full name, in definition
+// order.
+//
+// What a caller building a registry of schemas needs, and what
+// `avroresolve` walks to match a reader's names against a writer's.
+//
+// ```novo
+// use avroschema
+//
+// fn main() [io]
+//     match avroschema.parse("\"int\"")
+//         Ok(s)  => println("${list.len(avroschema.named_types(s))}")
+//         Err(e) => println(e.message())
+// ```
+pub fn named_types(s: AvroSchema) -> [Str] []
+    todo("avro-nv.avroschema.named_types")

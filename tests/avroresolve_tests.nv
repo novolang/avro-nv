@@ -1,0 +1,397 @@
+// avroresolve_tests.nv — schema resolution as a typed check, the
+// codec-as-a-value decision, the container file, and fingerprints.
+//
+// RED ON PURPOSE: every assertion reaches `not implemented:
+// avro-nv.<module>.<fn>`.
+
+use std.test
+use std.bytes
+use avrocodec
+use avroerror
+use avrofile
+use avrofp
+use avroresolve
+use avroschema
+use avrovalue
+
+@test
+fn test_resolution_happens_once_before_a_byte_is_decoded() [io]
+    // Avro's binary encoding has no markers, so a mismatch that is not
+    // caught here is not caught at all.
+    test.case("a schema resolves against itself, and that plan is the identity")
+    match avroschema.parse("\"int\"")
+        Ok(s)  =>
+            match avroresolve.resolve(s, s)
+                Ok(r)  =>
+                    test.assert(avroresolve.is_identity(r))
+                    test.assert(str.len(avroresolve.describe(r)) > 0)
+                Err(_) => test.fail("a schema resolves against itself")
+        Err(_) => test.fail("\"int\" is a schema")
+
+    test.case("and the cheap question answers without building a plan")
+    match avroschema.parse("\"int\"")
+        Ok(s)  => test.assert(avroresolve.resolves(s, s))
+        Err(_) => test.fail("\"int\" is a schema")
+
+@test
+fn test_the_six_promotions_go_one_way_only() [io]
+    test.case("int widens to long, float and double")
+    test.assert(avroresolve.promotes(AvroInt, AvroLong))
+    test.assert(avroresolve.promotes(AvroInt, AvroFloat))
+    test.assert(avroresolve.promotes(AvroInt, AvroDouble))
+
+    test.case("long widens to float and double, and float to double")
+    test.assert(avroresolve.promotes(AvroLong, AvroFloat))
+    test.assert(avroresolve.promotes(AvroLong, AvroDouble))
+    test.assert(avroresolve.promotes(AvroFloat, AvroDouble))
+
+    test.case("string and bytes convert BOTH ways, because the encodings are identical")
+    test.assert(avroresolve.promotes(AvroString, AvroBytes))
+    test.assert(avroresolve.promotes(AvroBytes, AvroString))
+
+    test.case("and nothing narrows — Avro will not truncate a value silently")
+    test.assert(not avroresolve.promotes(AvroLong, AvroInt))
+    test.assert(not avroresolve.promotes(AvroDouble, AvroFloat))
+    test.assert(not avroresolve.promotes(AvroDouble, AvroLong))
+
+    test.case("a writer's int against a reader's long is a plan, not a refusal")
+    match avroschema.parse("\"int\"")
+        Ok(w)  =>
+            match avroschema.parse("\"long\"")
+                Ok(r)  =>
+                    match avroresolve.resolve(w, r)
+                        Ok(p)  => test.assert(not avroresolve.is_identity(p))
+                        Err(_) => test.fail("int promotes to long")
+                Err(_) => test.fail("\"long\" is a schema")
+        Err(_) => test.fail("\"int\" is a schema")
+
+    test.case("and the other way round is a refusal")
+    match avroschema.parse("\"long\"")
+        Ok(w)  =>
+            match avroschema.parse("\"int\"")
+                Ok(r)  =>
+                    match avroresolve.resolve(w, r)
+                        Ok(_)  => test.fail("a long does not narrow to an int")
+                        Err(f) => test.assert(avroerror.kind_name(f.kind)
+                                              == "no-resolution")
+                Err(_) => test.fail("\"int\" is a schema")
+        Err(_) => test.fail("\"long\" is a schema")
+
+@test
+fn test_a_plan_says_read_skip_default_or_promote_per_field() [io]
+    test.case("the four actions have stable names")
+    test.assert(avroresolve.action_name(AvroReadField) == "read")
+    test.assert(avroresolve.action_name(AvroSkipField) == "skip")
+    test.assert(avroresolve.action_name(AvroDefaultField) == "default")
+    test.assert(avroresolve.action_name(AvroPromoteField) == "promote")
+
+    test.case("a skip step has no reader index, and a default step no writer index")
+    test.assert(avroresolve.step(AvroSkipField, 0, -1).reader_index == -1)
+    test.assert(avroresolve.step(AvroDefaultField, -1, 2).writer_index == -1)
+
+    test.case("a reader field the writer lacks and that has no default is THE failure")
+    test.assert(avroerror.is_schema_error(AvroMissingFieldNoDefault("nickname")))
+    test.assert(not avroerror.is_corrupt(AvroMissingFieldNoDefault("nickname")))
+
+@test
+fn test_an_alias_is_the_writers_and_never_the_readers() [io]
+    // Getting that backwards is the reason a rename "did not work".
+    test.case("a name matches itself")
+    match avroschema.parse("\"int\"")
+        Ok(s)  => test.assert(avroresolve.names_match(s, s))
+        Err(_) => test.fail("\"int\" is a schema")
+
+@test
+fn test_decoding_through_a_plan_has_no_decisions_left_to_make() [io]
+    test.case("a plan decodes a datum")
+    match avroschema.parse("\"int\"")
+        Ok(s)  =>
+            match avroresolve.resolve(s, s)
+                Ok(p)  =>
+                    match avroresolve.decode(bytes.zeros(1), 0, p,
+                                             avrobinary.default_limits())
+                        Ok(v)  => test.assert(avrovalue.kind_name(v) == "int")
+                        Err(_) => test.fail("one zero byte is the int 0")
+                Err(_) => test.fail("a schema resolves against itself")
+        Err(_) => test.fail("\"int\" is a schema")
+
+@test
+fn test_a_codec_is_a_value_because_avro_codec_is_an_open_set() [io]
+    // Depending on flate-nv, snappy-nv and zstd-nv would put three
+    // unimplemented interfaces in every consumer's closure.
+    test.case("null is built in, because it is not compression")
+    test.assert(avrocodec.name_of(avrocodec.null_codec()) == avrocodec.AVRO_CODEC_NULL)
+    test.assert(avrocodec.AVRO_CODEC_NULL == "null")
+
+    test.case("with nothing supplied, null is still readable and nothing else is")
+    let none = avrocodec.only_null()
+    test.assert(avrocodec.can_read(none, "null"))
+    test.assert(not avrocodec.can_read(none, "snappy"))
+    match avrocodec.codec_named(none, "null")
+        Some(_) => test.assert(true)
+        None    => test.fail("null is always available")
+    match avrocodec.codec_named(none, "deflate")
+        Some(_) => test.fail("deflate was not supplied")
+        None    => test.assert(true)
+
+    test.case("an unsupported codec is not a corrupt file")
+    test.assert(avroerror.is_unsupported(AvroUnsupportedCodec("snappy")))
+    test.assert(not avroerror.is_corrupt(AvroUnsupportedCodec("snappy")))
+
+    test.case("the names the specification and common practice define")
+    test.assert(avrocodec.is_known_name(avrocodec.AVRO_CODEC_DEFLATE))
+    test.assert(avrocodec.is_known_name(avrocodec.AVRO_CODEC_SNAPPY))
+    test.assert(avrocodec.is_known_name(avrocodec.AVRO_CODEC_ZSTANDARD))
+    test.assert(avrocodec.is_known_name(avrocodec.AVRO_CODEC_BZIP2))
+    test.assert(avrocodec.is_known_name(avrocodec.AVRO_CODEC_XZ))
+
+    test.case("and `zstd` is NOT one of them — the spelling is `zstandard`")
+    test.assert(not avrocodec.is_known_name("zstd"))
+    test.assert(avrocodec.AVRO_CODEC_ZSTANDARD == "zstandard")
+
+    test.case("Avro's snappy framing adds four bytes the Snappy format does not have")
+    test.assert(avrocodec.AVRO_SNAPPY_TRAILER_BYTES == 4)
+
+    test.case("the null codec can write, and its round trip is the identity")
+    test.assert(avrocodec.can_write(avrocodec.null_codec()))
+    match avrocodec.decompress(avrocodec.null_codec(), bytes.zeros(4), 0, 4, 1048576)
+        Ok(b)  => test.assert(bytes.len(b) == 4)
+        Err(_) => test.fail("null decompresses to itself")
+    match avrocodec.compress(avrocodec.null_codec(), bytes.zeros(4), 0, 4)
+        Ok(b)  => test.assert(bytes.len(b) == 4)
+        Err(_) => test.fail("null compresses to itself")
+
+@test
+fn test_a_supplied_codec_is_two_or_three_named_functions() [io]
+    test.case("a reader-only codec cannot write")
+    match avrocodec.reader_codec("deflate", stub_size, stub_run)
+        Ok(c)  =>
+            test.assert(avrocodec.name_of(c) == "deflate")
+            test.assert(not avrocodec.can_write(c))
+        Err(_) => test.fail("deflate is a legal codec name")
+
+    test.case("a full codec can")
+    match avrocodec.codec("deflate", stub_size, stub_run, stub_run)
+        Ok(c)  => test.assert(avrocodec.can_write(c))
+        Err(_) => test.fail("deflate is a legal codec name")
+
+    test.case("and `null` may not be replaced, because it is not compression")
+    match avrocodec.reader_codec("null", stub_size, stub_run)
+        Ok(_)  => test.fail("null is built in")
+        Err(f) => test.assert(avroerror.kind_name(f.kind) == "bad-parameter")
+
+fn stub_size(src: Bytes, at: Int, len: Int) -> Int
+    0
+
+fn stub_run(src: Bytes, at: Int, len: Int) -> Bytes
+    bytes.zeros(0)
+
+@test
+fn test_the_sync_marker_is_why_the_container_format_exists() [io]
+    // Sixteen random bytes at the end of every block, so a
+    // five-gigabyte file can be split at an arbitrary offset.
+    test.case("the header's shape is fixed")
+    test.assert(avrofile.AVRO_FILE_MAGIC_BYTES == 4)
+    test.assert(avrofile.AVRO_SYNC_BYTES == 16)
+    test.assert(avrofile.AVRO_META_SCHEMA == "avro.schema")
+    test.assert(avrofile.AVRO_META_CODEC == "avro.codec")
+
+    test.case("a file that does not start with Obj 1 is not a container file")
+    match avrofile.read_header(bytes.zeros(64))
+        Ok(_)  => test.fail("sixty-four zero bytes are not a container file")
+        Err(f) => test.assert(avroerror.kind_name(f.kind) == "bad-file-magic")
+
+    test.case("and a sync-marker mismatch says a reader is not where it thought")
+    test.assert(avroerror.is_corrupt(AvroSyncMismatch(3)))
+
+    test.case("scanning for the marker is what a split reader does")
+    test.assert(avrofile.sync_after(bytes.zeros(64), 0, bytes.zeros(16)) >= -1)
+
+@test
+fn test_a_block_declares_its_count_and_its_size_so_it_can_be_skipped() [io]
+    test.case("a block header is three numbers")
+    let b = avrofile.block(100, 4096, 64)
+    test.assert(b.count == 100 and b.byte_size == 4096 and b.data_at == 64)
+
+    test.case("a reader over a file that is not one is refused at open")
+    match avrofile.reader(bytes.zeros(64), avrocodec.only_null())
+        Ok(_)  => test.fail("sixty-four zero bytes are not a container file")
+        Err(f) => test.assert(avroerror.is_corrupt(f.kind))
+
+    test.case("and so is one whose reader schema does not resolve")
+    match avroschema.parse("\"int\"")
+        Ok(s)  =>
+            match avrofile.reader_with_schema(bytes.zeros(64),
+                                              avrocodec.only_null(), s)
+                Ok(_)  => test.fail("sixty-four zero bytes are not a container file")
+                Err(f) => test.assert(avroerror.is_corrupt(f.kind))
+        Err(_) => test.fail("\"int\" is a schema")
+
+    test.case("reading everything is the convenience over the block walk")
+    match avrofile.read_all(bytes.zeros(64), avrocodec.only_null(), -1)
+        Ok(_)  => test.fail("sixty-four zero bytes are not a container file")
+        Err(f) => test.assert(avroerror.is_corrupt(f.kind))
+
+@test
+fn test_a_reader_is_asked_about_its_codec_at_open_and_not_on_block_4000() [io]
+    // A file whose blocks are all `snappy` and a build with no Snappy
+    // is a refusal that should happen at open time and name the codec.
+    test.case("the header answers its metadata, its codec and its readability")
+    match avrofile.read_header(bytes.zeros(64))
+        Ok(h)  =>
+            match avrofile.meta(h, "avro.codec")
+                Some(_) => test.assert(true)
+                None    => test.assert(true)
+            test.assert(avrofile.readable_with(h, avrocodec.only_null()))
+        Err(f) => test.assert(avroerror.is_corrupt(f.kind))
+
+    test.case("and a reader walks blocks, skips them, and counts what it read")
+    match avrofile.reader(bytes.zeros(64), avrocodec.only_null())
+        Ok(r)  =>
+            test.assert(avrofile.blocks_read(r) == 0)
+            test.assert(avrofile.records_read(r) == 0)
+            match avrofile.next_block(r, bytes.zeros(64))
+                Ok(b)  => test.assert(b.count >= 0)
+                Err(e) => test.assert(avroerror.is_corrupt(e.kind))
+            match avrofile.read_block(r, bytes.zeros(64), 1048576)
+                Ok(b)  => test.assert(list.len(b.records) >= 0)
+                Err(e) => test.assert(avroerror.is_corrupt(e.kind))
+            match avrofile.skip_block(r, bytes.zeros(64))
+                Ok(r2) => test.assert(avrofile.blocks_read(r2) >= 0)
+                Err(e) => test.assert(avroerror.is_corrupt(e.kind))
+        Err(f) => test.assert(avroerror.is_corrupt(f.kind))
+
+@test
+fn test_the_writer_takes_the_random_marker_rather_than_making_one() [io]
+    // `core` has no `[rand]`, and a hard-coded marker would one day
+    // appear inside somebody's data.
+    test.case("a writer takes sixteen bytes and a codec that can write")
+    match avroschema.parse("\"int\"")
+        Ok(s)  =>
+            match avrofile.writer(s, avrocodec.null_codec(), bytes.zeros(16))
+                Ok(w)  =>
+                    test.assert(avrofile.pending(w) == 0)
+                    test.assert(avrofile.with_block_records(w, 1000).block_records
+                                == 1000)
+                Err(_) => test.fail("sixteen bytes is a marker")
+        Err(_) => test.fail("\"int\" is a schema")
+
+    test.case("a marker of the wrong length is refused")
+    match avroschema.parse("\"int\"")
+        Ok(s)  =>
+            match avrofile.writer(s, avrocodec.null_codec(), bytes.zeros(8))
+                Ok(_)  => test.fail("a marker is sixteen bytes")
+                Err(f) => test.assert(avroerror.kind_name(f.kind) == "bad-parameter")
+        Err(_) => test.fail("\"int\" is a schema")
+
+    test.case("appending buffers until a block fills, and flushing closes the file")
+    match avroschema.parse("\"int\"")
+        Ok(s)  =>
+            match avrofile.writer(s, avrocodec.null_codec(), bytes.zeros(16))
+                Ok(w)  =>
+                    match avrofile.header_bytes(w, [], [])
+                        Ok(h)  => test.assert(bytes.len(h) > 0)
+                        Err(_) => test.fail("a header is bytes")
+                    match avrofile.append(w, avrovalue.long_value(1))
+                        Ok(a)  => test.assert(bytes.len(a.block) == 0)
+                        Err(_) => test.fail("one record buffers")
+                    match avrofile.flush(w)
+                        Ok(b)  => test.assert(bytes.len(b) >= 0)
+                        Err(_) => test.fail("flushing an empty writer is legal")
+                Err(_) => test.fail("sixteen bytes is a marker")
+        Err(_) => test.fail("\"int\" is a schema")
+
+@test
+fn test_crc64_avro_is_not_any_standard_crc64() [io]
+    // A port that reached for a CRC-64 it already had would produce
+    // fingerprints no other Avro reader recognises.
+    test.case("the specification's two worked examples")
+    test.assert(avrofp.rabin("\"null\"") == avrofp.AVRO_RABIN_CHECK_NULL)
+    test.assert(avrofp.rabin("\"string\"") == avrofp.AVRO_RABIN_CHECK_STRING)
+    test.assert(avrofp.AVRO_RABIN_CHECK_NULL == 0x63DD24E7CC258F8A)
+
+    test.case("the polynomial is also the initial value, which is what makes it Rabin")
+    test.assert(avrofp.AVRO_RABIN_CONSTANT == 0xC15D213AA4D7A795)
+
+    test.case("a schema's fingerprint is the rabin of its canonical form")
+    match avroschema.parse("\"null\"")
+        Ok(s)  => test.assert(avrofp.fingerprint(s) == avrofp.AVRO_RABIN_CHECK_NULL)
+        Err(_) => test.fail("\"null\" is a schema")
+
+    test.case("and the table's first entry is a table entry")
+    match avrofp.rabin_table_entry(0)
+        Ok(_)  => test.assert(true)
+        Err(_) => test.fail("0 is inside the table")
+    match avrofp.rabin_table_entry(256)
+        Ok(_)  => test.fail("256 is past the table")
+        Err(f) => test.assert(avroerror.kind_name(f.kind) == "bad-parameter")
+
+@test
+fn test_single_object_encoding_is_two_marker_bytes_and_eight_more() [io]
+    test.case("the prefix is ten bytes")
+    test.assert(avrofp.AVRO_SINGLE_OBJECT_MARKER_BYTES == 2)
+    test.assert(avrofp.AVRO_FINGERPRINT_BYTES == 8)
+    test.assert(avrofp.AVRO_SINGLE_OBJECT_PREFIX_BYTES == 10)
+
+    test.case("a fingerprint is written LITTLE-endian, not network order")
+    test.assert(bytes.len(avrofp.fingerprint_bytes(0)) == 8)
+    match avrofp.fingerprint_from(bytes.zeros(8), 0)
+        Ok(fp) => test.assert(fp == 0)
+        Err(_) => test.fail("eight bytes is a fingerprint")
+
+    test.case("a buffer with fewer than eight bytes has no fingerprint in it")
+    match avrofp.fingerprint_from(bytes.zeros(4), 0)
+        Ok(_)  => test.fail("four bytes is not eight")
+        Err(f) => test.assert(avroerror.is_limit(f.kind))
+
+    test.case("the marker is the cheap check a consumer makes first")
+    test.assert(not avrofp.is_single_object(bytes.zeros(10), 0))
+    match avrofp.read_single_object_prefix(bytes.zeros(10), 0)
+        Ok(_)  => test.fail("ten zero bytes are not a single-object encoding")
+        Err(f) => test.assert(avroerror.kind_name(f.kind)
+                              == "bad-single-object-marker")
+
+    test.case("a prefix can be built from a schema")
+    match avroschema.parse("\"null\"")
+        Ok(s)  => test.assert(bytes.len(avrofp.single_object_prefix(s)) == 10)
+        Err(_) => test.fail("\"null\" is a schema")
+
+    test.case("an unknown fingerprint is the CALLER missing a schema, not a bad message")
+    test.assert(avroerror.is_unsupported(AvroUnknownFingerprint("63dd24e7cc258f8a")))
+    match avrofp.schema_for(0, [])
+        Ok(_)  => test.fail("no schema was offered")
+        Err(f) => test.assert(avroerror.is_unsupported(f.kind))
+
+    test.case("and a wider fingerprint takes the digest as a named function")
+    match avroschema.parse("\"null\"")
+        Ok(s)  => test.assert(bytes.len(avrofp.wide_fingerprint(s, stub_digest)) == 32)
+        Err(_) => test.fail("\"null\" is a schema")
+
+fn stub_digest(data: Bytes) -> Bytes
+    bytes.zeros(32)
+
+@test
+fn test_a_fault_names_where_it_was_and_reads_as_one_sentence() [io]
+    test.case("a schema fault has a dotted path")
+    test.assert(avroerror.at_path("com.example.User.address.zip").path
+                == "com.example.User.address.zip")
+
+    test.case("a stream fault has a block and an offset")
+    let w = avroerror.at_offset(3, 1024)
+    test.assert(w.block == 3 and w.offset == 1024)
+
+    test.case("and the useful one has both")
+    let b = avroerror.at_both("User.zip", 12, 480)
+    test.assert(b.path == "User.zip" and b.block == 12 and b.offset == 480)
+
+    test.case("a fault is a kind and a place, and it reports as one line")
+    let f = avroerror.fault(AvroBadFileMagic, avroerror.at_offset(-1, 0))
+    test.assert(avroerror.kind_name(f.kind) == "bad-file-magic")
+    test.assert(str.len(avroerror.describe(f)) > 0)
+    test.assert(str.len(f.message()) > 0)
+
+    test.case("and the four questions partition every kind")
+    test.assert(avroerror.is_incomplete(AvroTruncated))
+    test.assert(not avroerror.is_schema_error(AvroTruncated))
+    test.assert(not avroerror.is_limit(AvroTruncated))
+    test.assert(not avroerror.is_unsupported(AvroTruncated))

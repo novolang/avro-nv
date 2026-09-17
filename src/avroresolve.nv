@@ -1,0 +1,334 @@
+// avroresolve.nv — schema resolution as a TYPED CHECK, made once,
+// before a single byte is decoded.
+//
+// Every body is a `todo()`.  The signatures are the design, and the
+// compiler checks them as claims; see the README for the stamp.
+//
+// THIS MODULE IS WHY THE PACKAGE IS SHAPED THE WAY IT IS.  Avro's
+// binary encoding has no markers: no field tags, no lengths on a
+// record, no terminators.  A decoder reading with a schema that does
+// not match the writer's therefore does not fail — it reads the next
+// field's bytes as this field's, produces a plausible wrong value, and
+// carries on until it runs off the end of the block, if it ever does.
+//
+// SO RESOLUTION CANNOT BE SOMETHING THE DECODER DOES AS IT GOES.  It
+// is a check over two schemas, performed once, that either produces a
+// PLAN or names the rule that failed.  `AvroResolution` is that plan:
+// a value that says, per field, whether to read it, skip it, or fill
+// it from a default, and per branch and per symbol how the writer's
+// index maps to the reader's.  Decoding then cannot go wrong, because
+// every decision was made before it started.
+//
+// THE SPECIFICATION'S RULES, AND ALL OF THEM ARE HERE.
+//
+//   Same type            resolves.
+//   int → long,          resolves: a widening promotion, and only in
+//   float, double        that direction.
+//   long → float,        resolves.
+//   double
+//   float → double       resolves.
+//   string ↔ bytes       resolves, both ways: the encodings are
+//                        identical.
+//   records              resolve when their names match — the
+//                        reader's name against the writer's name or
+//                        any of the writer's ALIASES.  Then, per
+//                        field: a field in both resolves recursively;
+//                        a field only the writer has is SKIPPED; a
+//                        field only the reader has needs a DEFAULT or
+//                        the whole resolution fails.
+//   enums                resolve by name.  A symbol the writer wrote
+//                        that the reader does not have falls back to
+//                        the reader's `default` symbol, or fails.
+//   arrays, maps         resolve when their elements do.
+//   fixed                resolves by name AND size.
+//   writer is a union    the reader resolves against the branch the
+//                        writer actually wrote.
+//   reader is a union    the FIRST branch that resolves against the
+//                        writer's schema wins.
+//
+// THE ASYMMETRY IN THE LAST TWO IS THE ONE PEOPLE MISS.  A reader that
+// is a union picks its first matching branch, so the ORDER of a
+// reader's union changes what it reads — and adding a branch to the
+// front of a union is a breaking change even though adding one to the
+// back is not.
+//
+// A PLAN IS ALSO THE ANSWER TO "IS THIS CHANGE SAFE?"  A caller with
+// an old schema and a new one calls `resolve` and is told, at build
+// time or at review time, exactly which rule a proposed change breaks.
+
+use avroerror
+use avroschema
+use avrovalue
+
+// What a reader does with one of the writer's fields.
+//
+// ```novo
+// use avroresolve
+//
+// fn main() [io]
+//     println(avroresolve.action_name(AvroSkipField))
+// ```
+pub enum AvroFieldAction
+    // Read it into a reader's field.
+    AvroReadField
+    // Decode past it and throw it away: the writer has it and the
+    // reader does not.  NOT an error — it is how a writer adds a
+    // field without breaking an old reader.
+    AvroSkipField
+    // Fill a reader's field from its default: the reader has it and
+    // the writer does not.  NOT an error either, when there is a
+    // default — it is how a reader adds a field without breaking on
+    // old data.
+    AvroDefaultField
+    // Read it and PROMOTE it: the writer wrote an `int` and the
+    // reader wants a `long`, or one of the other five promotions.
+    AvroPromoteField
+
+// The specification's name for an action: `"read"`, `"skip"`,
+// `"default"`, `"promote"`.
+//
+// ```novo
+// use avroresolve
+//
+// fn main() [io]
+//     println(avroresolve.action_name(AvroReadField))
+// ```
+pub fn action_name(a: AvroFieldAction) -> Str []
+    todo("avro-nv.avroresolve.action_name")
+
+// One step of a plan: what to do with one of the writer's fields, or
+// one of the reader's that the writer lacks.
+//
+// ```novo
+// use avroresolve
+//
+// fn main() [io]
+//     println("${avroresolve.step(AvroSkipField, 0, -1).writer_index}")
+// ```
+pub struct AvroResolveStep
+    // What to do.
+    action: AvroFieldAction
+    // Which of the writer's fields this is, in the writer's order, or
+    // `-1` for an `AvroDefaultField` step.
+    writer_index: Int
+    // Which of the reader's fields it becomes, in the reader's order,
+    // or `-1` for an `AvroSkipField` step.
+    reader_index: Int
+
+// A step from its three parts.
+//
+// ```novo
+// use avroresolve
+//
+// fn main() [io]
+//     println(avroresolve.action_name(avroresolve.step(AvroReadField, 0, 0).action))
+// ```
+pub fn step(action: AvroFieldAction, writer_index: Int, reader_index: Int) -> AvroResolveStep []
+    todo("avro-nv.avroresolve.step")
+
+// A plan for reading data written with one schema through another.
+//
+// The value a decoder takes instead of two schemas.  Built once, and
+// then a million records decode with no decisions left to make.
+//
+// ```novo
+// use avroresolve
+// use avroschema
+//
+// fn main() [io]
+//     match avroschema.parse("\"int\"")
+//         Ok(w) =>
+//             match avroresolve.resolve(w, w)
+//                 Ok(r)  => println("${avroresolve.is_identity(r)}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub struct AvroResolution
+    // The writer's schema.
+    writer: AvroSchema
+    // The reader's schema.
+    reader: AvroSchema
+    // The per-field plan, for a record pair: one step per writer field
+    // plus one per reader-only field with a default, in the order a
+    // decoder performs them.
+    steps: [AvroResolveStep]
+    // For an enum pair, the reader's symbol index for each of the
+    // writer's, or `-1` for one that falls back to the reader's
+    // `default`.
+    symbol_map: [Int]
+    // For a union pair, the reader's branch index for each of the
+    // writer's.
+    branch_map: [Int]
+    // The values reader-only fields are filled with, already decoded
+    // from their defaults under the READER's schema, in the order
+    // their `AvroDefaultField` steps appear.
+    //
+    // Decoded HERE and not per record, because a default is a constant
+    // and decoding it a million times is a million times too many.
+    defaults: [AvroValue]
+    // The nested plans, one per `AvroReadField` or `AvroPromoteField`
+    // step whose field is itself a record, enum, array, map, union or
+    // fixed.
+    nested: [AvroResolution]
+
+// Resolve a reader's schema against a writer's.
+//
+// `AvroNoResolution` naming the rule that failed, in the
+// specification's own words, and `AvroMissingFieldNoDefault` naming
+// the field for the failure people actually hit.
+// `avroerror.is_schema_error` answers true for both: neither is about
+// anybody's bytes.
+//
+// THE CALL THIS PACKAGE EXISTS FOR.  Nothing else catches a schema
+// mismatch, because the binary encoding has nothing in it to catch one
+// with.
+//
+// ```novo
+// use avroresolve
+// use avroschema
+//
+// fn main() [io]
+//     match avroschema.parse("\"int\"")
+//         Ok(w) =>
+//             match avroschema.parse("\"long\"")
+//                 Ok(r) =>
+//                     match avroresolve.resolve(w, r)
+//                         Ok(_)  => println("int promotes to long")
+//                         Err(e) => println(e.message())
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn resolve(writer: AvroSchema, reader: AvroSchema) -> Result<AvroResolution, AvroFault> []
+    todo("avro-nv.avroresolve.resolve")
+
+// Whether the two schemas resolve at all, with no plan built.
+//
+// The cheap question, for a caller checking a hundred schema pairs in
+// a registry and only wanting to know which ones are broken.
+//
+// ```novo
+// use avroresolve
+// use avroschema
+//
+// fn main() [io]
+//     match avroschema.parse("\"int\"")
+//         Ok(s)  => println("${avroresolve.resolves(s, s)}")
+//         Err(e) => println(e.message())
+// ```
+pub fn resolves(writer: AvroSchema, reader: AvroSchema) -> Bool []
+    todo("avro-nv.avroresolve.resolves")
+
+// Whether a plan is the identity: read every field, promote nothing,
+// skip nothing, default nothing.
+//
+// A decoder can take a faster path when it is, and a caller reviewing
+// a schema change wants to know when a change did nothing.
+//
+// ```novo
+// use avroresolve
+// use avroschema
+//
+// fn main() [io]
+//     match avroschema.parse("\"int\"")
+//         Ok(s) =>
+//             match avroresolve.resolve(s, s)
+//                 Ok(r)  => println("${avroresolve.is_identity(r)}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn is_identity(r: AvroResolution) -> Bool []
+    todo("avro-nv.avroresolve.is_identity")
+
+// Whether one primitive type promotes to another.
+//
+// `int` to `long`, `float` or `double`; `long` to `float` or
+// `double`; `float` to `double`; `string` to `bytes` and back.  Six
+// promotions and two conversions, and NONE of them in the other
+// direction — a writer's `long` does not resolve against a reader's
+// `int`, because the value might not fit and Avro will not truncate
+// one silently.
+//
+// ```novo
+// use avroresolve
+// use avroschema
+//
+// fn main() [io]
+//     println("${avroresolve.promotes(AvroInt, AvroLong)}")
+//     println("${avroresolve.promotes(AvroLong, AvroInt)}")
+// ```
+pub fn promotes(writer: AvroType, reader: AvroType) -> Bool []
+    todo("avro-nv.avroresolve.promotes")
+
+// Whether a reader's name matches a writer's, aliases included.
+//
+// The reader's full name against the writer's full name OR any of the
+// writer's aliases.  ONE DIRECTION ONLY: an alias on the reader does
+// nothing, because it is the writer's data that has to be recognised.
+// Getting that backwards is the reason a rename "did not work".
+//
+// ```novo
+// use avroresolve
+// use avroschema
+//
+// fn main() [io]
+//     match avroschema.parse("\"int\"")
+//         Ok(s)  => println("${avroresolve.names_match(s, s)}")
+//         Err(e) => println(e.message())
+// ```
+pub fn names_match(writer: AvroSchema, reader: AvroSchema) -> Bool []
+    todo("avro-nv.avroresolve.names_match")
+
+// Decode a datum written with the plan's writer schema into the plan's
+// reader schema.
+//
+// The decoder with every decision already made.  Skips the writer's
+// extra fields, fills the reader's missing ones from the defaults this
+// plan already decoded, maps enum and union indices, and promotes
+// where the plan says to.
+//
+// ```novo
+// use std.bytes
+// use avrobinary
+// use avroresolve
+// use avroschema
+//
+// fn main() [io]
+//     match avroschema.parse("\"int\"")
+//         Ok(s) =>
+//             match avroresolve.resolve(s, s)
+//                 Ok(r) =>
+//                     match avroresolve.decode(bytes.zeros(1), 0, r,
+//                                              avrobinary.default_limits())
+//                         Ok(v)  => println(avrovalue.kind_name(v))
+//                         Err(e) => println(e.message())
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn decode(src: Bytes, off: Int, r: AvroResolution,
+              limits: AvroLimits) -> Result<AvroValue, AvroFault> []
+    todo("avro-nv.avroresolve.decode")
+
+// A sentence saying what a schema change did, for a reader deciding
+// whether to make it.
+//
+// "Field `nickname` added with a default, so old data reads."
+// "Field `id` promoted from int to long."  "Branch added to the FRONT
+// of union `status`, which changes what an old reader reads."
+//
+// The plan is already the answer; this is the plan in words, because a
+// schema review is read by people and a list of steps is not.
+//
+// ```novo
+// use avroresolve
+// use avroschema
+//
+// fn main() [io]
+//     match avroschema.parse("\"int\"")
+//         Ok(s) =>
+//             match avroresolve.resolve(s, s)
+//                 Ok(r)  => println(avroresolve.describe(r))
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn describe(r: AvroResolution) -> Str []
+    todo("avro-nv.avroresolve.describe")

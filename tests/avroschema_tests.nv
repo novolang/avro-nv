@@ -1,0 +1,259 @@
+// avroschema_tests.nv — the schema language, its naming rules, the
+// logical-type annotations and the canonical form.
+//
+// RED ON PURPOSE: every assertion reaches `not implemented:
+// avro-nv.<module>.<fn>`.
+
+use std.test
+use avroerror
+use avrological
+use avroschema
+
+@test
+fn test_the_fourteen_types_and_which_of_them_are_named() [io]
+    test.case("eight primitives")
+    test.assert(avroschema.is_primitive(AvroNull))
+    test.assert(avroschema.is_primitive(AvroBoolean))
+    test.assert(avroschema.is_primitive(AvroInt))
+    test.assert(avroschema.is_primitive(AvroLong))
+    test.assert(avroschema.is_primitive(AvroFloat))
+    test.assert(avroschema.is_primitive(AvroDouble))
+    test.assert(avroschema.is_primitive(AvroBytes))
+    test.assert(avroschema.is_primitive(AvroString))
+
+    test.case("and six complex ones, of which three are named")
+    test.assert(not avroschema.is_primitive(AvroRecord))
+    test.assert(avroschema.is_named(AvroRecord))
+    test.assert(avroschema.is_named(AvroEnum))
+    test.assert(avroschema.is_named(AvroFixed))
+    test.assert(not avroschema.is_named(AvroArray))
+    test.assert(not avroschema.is_named(AvroMap))
+    test.assert(not avroschema.is_named(AvroUnion))
+
+    test.case("each has the specification's own name")
+    test.assert(avroschema.type_name(AvroNull) == "null")
+    test.assert(avroschema.type_name(AvroFixed) == "fixed")
+    test.assert(avroschema.type_name(AvroRecord) == "record")
+
+    test.case("and a primitive schema can be built without JSON")
+    test.assert(avroschema.type_name(avroschema.primitive(AvroDouble).kind)
+                == "double")
+
+@test
+fn test_a_schema_is_parsed_once_and_every_rule_checked_then() [io]
+    test.case("a bare string is a primitive schema")
+    match avroschema.parse("\"string\"")
+        Ok(s)  => test.assert(avroschema.type_name(s.kind) == "string")
+        Err(_) => test.fail("\"string\" is a schema")
+
+    test.case("an array names its element type")
+    match avroschema.parse("{\"type\":\"array\",\"items\":\"int\"}")
+        Ok(s)  => test.assert(avroschema.type_name(s.kind) == "array")
+        Err(_) => test.fail("that is an array schema")
+
+    test.case("text that is not JSON is refused as such")
+    match avroschema.parse("{")
+        Ok(_)  => test.fail("a lone brace is not JSON")
+        Err(f) => test.assert(avroerror.kind_name(f.kind) == "schema-not-json")
+
+    test.case("a type that is neither primitive, complex nor defined earlier")
+    match avroschema.parse("\"Colour\"")
+        Ok(_)  => test.fail("Colour is not defined anywhere")
+        Err(f) => test.assert(avroerror.kind_name(f.kind) == "unknown-type")
+
+    test.case("and every schema fault is a developer's problem, not a file's")
+    test.assert(avroerror.is_schema_error(AvroUnknownType("Colour")))
+    test.assert(not avroerror.is_corrupt(AvroUnknownType("Colour")))
+    test.assert(not avroerror.is_unsupported(AvroUnknownType("Colour")))
+
+@test
+fn test_the_full_name_rule_is_the_one_everybody_gets_wrong() [io]
+    test.case("a name with a dot in it is already a full name")
+    test.assert(avroschema.full_name_in("com.other.User", "com.example", "com.top")
+                == "com.other.User")
+
+    test.case("otherwise the namespace attribute applies")
+    test.assert(avroschema.full_name_in("User", "com.example", "com.top")
+                == "com.example.User")
+
+    test.case("otherwise the ENCLOSING namespace applies")
+    test.assert(avroschema.full_name_in("User", "", "com.top") == "com.top.User")
+
+    test.case("and with neither, the name is its own full name")
+    test.assert(avroschema.full_name_in("User", "", "") == "User")
+
+    test.case("the namespace of a full name is everything before the last dot")
+    test.assert(avroschema.namespace_of("com.example.User") == "com.example")
+    test.assert(avroschema.namespace_of("User") == "")
+
+    test.case("a name starts with a letter or underscore")
+    test.assert(avroschema.is_legal_name("User"))
+    test.assert(avroschema.is_legal_name("_9"))
+    test.assert(not avroschema.is_legal_name("9lives"))
+    test.assert(not avroschema.is_legal_name("has-a-dash"))
+
+    test.case("a schema can be parsed inside an enclosing namespace")
+    match avroschema.parse_in("\"int\"", "com.example")
+        Ok(s)  => test.assert(avroschema.type_name(s.kind) == "int")
+        Err(_) => test.fail("\"int\" is a schema anywhere")
+
+@test
+fn test_a_union_is_its_branch_order_and_nothing_else() [io]
+    test.case("a nullable string is a two-branch union")
+    match avroschema.parse("[\"null\",\"string\"]")
+        Ok(s)  =>
+            test.assert(avroschema.type_name(s.kind) == "union")
+            test.assert(avroschema.branch_index(s, "string") == 1)
+            test.assert(avroschema.null_branch(s) == 0)
+        Err(_) => test.fail("that is a union schema")
+
+    test.case("a union with no null branch says so")
+    match avroschema.parse("[\"int\",\"string\"]")
+        Ok(s)  => test.assert(avroschema.null_branch(s) == -1)
+        Err(_) => test.fail("that is a union schema")
+
+    test.case("a union may not contain a union — the index would be ambiguous")
+    match avroschema.parse("[\"null\",[\"int\",\"string\"]]")
+        Ok(_)  => test.fail("a union may not contain a union")
+        Err(f) => test.assert(avroerror.is_schema_error(f.kind))
+
+    test.case("and may not repeat a type, for the same reason")
+    match avroschema.parse("[\"int\",\"int\"]")
+        Ok(_)  => test.fail("a union may not repeat an unnamed type")
+        Err(f) => test.assert(avroerror.is_schema_error(f.kind))
+
+@test
+fn test_a_field_default_is_checked_when_the_schema_is_read() [io]
+    // The person who can fix a bad default is the person reading the
+    // schema, not the one reading a file six months later.
+    test.case("a field starts with no default")
+    match avroschema.parse("\"long\"")
+        Ok(s)  =>
+            let f = avroschema.field("id", s)
+            test.assert(f.name == "id")
+            test.assert(not f.has_default)
+        Err(_) => test.fail("\"long\" is a schema")
+
+    test.case("and a default that fits is accepted")
+    match avroschema.parse("\"long\"")
+        Ok(s)  =>
+            match avroschema.with_default(avroschema.field("id", s), "0")
+                Ok(f)  => test.assert(f.has_default)
+                Err(_) => test.fail("0 fits a long")
+        Err(_) => test.fail("\"long\" is a schema")
+
+    test.case("one that does not is refused, naming the field")
+    match avroschema.parse("\"long\"")
+        Ok(s)  =>
+            match avroschema.with_default(avroschema.field("id", s), "\"x\"")
+                Ok(_)  => test.fail("a string does not fit a long")
+                Err(f) => test.assert(avroerror.kind_name(f.kind) == "bad-default")
+        Err(_) => test.fail("\"long\" is a schema")
+
+    test.case("fields and symbols are looked up by name and by index")
+    match avroschema.parse("\"long\"")
+        Ok(s)  =>
+            match avroschema.field_named(s, "id")
+                Some(_) => test.fail("a long has no fields")
+                None    => test.assert(true)
+            test.assert(avroschema.symbol_index(s, "RED") == -1)
+        Err(_) => test.fail("\"long\" is a schema")
+
+@test
+fn test_the_canonical_form_strips_what_does_not_change_the_reading() [io]
+    test.case("a doc attribute is not in the canonical form")
+    match avroschema.parse("{\"type\":\"int\",\"doc\":\"an id\"}")
+        Ok(s)  =>
+            test.assert(not str.contains(avroschema.canonical_form(s), "doc"))
+            test.assert(avroschema.canonical_form(s) == "\"int\"")
+        Err(_) => test.fail("that is an int schema with a doc")
+
+    test.case("but the ordinary JSON form keeps it")
+    match avroschema.parse("{\"type\":\"int\",\"doc\":\"an id\"}")
+        Ok(s)  => test.assert(str.len(avroschema.to_json(s)) > 0)
+        Err(_) => test.fail("that is an int schema with a doc")
+
+    test.case("and a schema lists the named types it defines")
+    match avroschema.parse("\"int\"")
+        Ok(s)  => test.assert(list.len(avroschema.named_types(s)) == 0)
+        Err(_) => test.fail("an int defines no named types")
+
+@test
+fn test_an_unusable_logical_type_is_ignored_and_not_refused() [io]
+    // The specification requires it: the implementation uses the
+    // underlying type and carries on.
+    test.case("a date is an int with an annotation")
+    match avroschema.parse("{\"type\":\"int\",\"logicalType\":\"date\"}")
+        Ok(s)  =>
+            test.assert(avrological.logical_name(avrological.of(s)) == "date")
+            test.assert(avrological.fits(AvroDate, s))
+        Err(_) => test.fail("that is a date schema")
+
+    test.case("an annotation that does not fit answers `not logical`")
+    match avroschema.parse("{\"type\":\"string\",\"logicalType\":\"date\"}")
+        Ok(s)  =>
+            test.assert(avrological.logical_name(avrological.of(s)) == "")
+            test.assert(not avrological.fits(AvroDate, s))
+        Err(_) => test.fail("that is a string schema with a bad annotation")
+
+    test.case("and `check` is the separate call that TELLS you it was ignored")
+    match avroschema.parse("{\"type\":\"string\",\"logicalType\":\"date\"}")
+        Ok(s)  =>
+            match avrological.check(s)
+                Ok(_)  => test.fail("date does not fit a string")
+                Err(f) => test.assert(avroerror.kind_name(f.kind)
+                                      == "bad-logical-type")
+        Err(_) => test.fail("that is a string schema with a bad annotation")
+
+    test.case("each logical type sits on exactly one underlying type")
+    test.assert(avroschema.type_name(avrological.underlying(AvroDate)) == "int")
+    test.assert(avroschema.type_name(avrological.underlying(AvroTimeMicros)) == "long")
+    test.assert(avroschema.type_name(avrological.underlying(AvroUuid)) == "string")
+    test.assert(avroschema.type_name(avrological.underlying(AvroDuration)) == "fixed")
+
+@test
+fn test_a_timestamp_and_a_local_timestamp_are_not_the_same_thing() [io]
+    // Both are a `long` of the same magnitude, and a reader that
+    // confused them is wrong by however far the writer was from UTC.
+    test.case("the three timestamps are instants")
+    test.assert(avrological.is_instant(AvroTimestampMillis))
+    test.assert(avrological.is_instant(AvroTimestampMicros))
+    test.assert(avrological.is_instant(AvroTimestampNanos))
+
+    test.case("and the three local timestamps are not")
+    test.assert(not avrological.is_instant(AvroLocalTimestampMillis))
+    test.assert(not avrological.is_instant(AvroLocalTimestampMicros))
+    test.assert(not avrological.is_instant(AvroLocalTimestampNanos))
+
+@test
+fn test_a_decimal_is_signed_and_a_duration_is_little_endian() [io]
+    test.case("18 digits need 8 bytes of fixed, by the specification's formula")
+    match avrological.decimal_fixed_bytes(18)
+        Ok(n)  => test.assert(n == 8)
+        Err(_) => test.fail("18 is a precision")
+
+    test.case("a precision below one is not a precision")
+    match avrological.decimal_fixed_bytes(0)
+        Ok(_)  => test.fail("zero digits is not a decimal")
+        Err(f) => test.assert(avroerror.kind_name(f.kind) == "bad-parameter")
+
+    test.case("the unscaled integer is TWO'S COMPLEMENT, so negatives work")
+    match avrological.decimal_bytes(-1234)
+        Ok(b)  =>
+            match avrological.decimal_unscaled(b)
+                Ok(n)  => test.assert(n == -1234)
+                Err(_) => test.fail("it round-trips")
+        Err(_) => test.fail("-1234 is an unscaled integer")
+
+    test.case("a duration is three UNSIGNED little-endian 32-bit counts")
+    match avrological.duration_bytes(1, 2, 3)
+        Ok(b)  =>
+            match avrological.duration_of(b)
+                Ok(d)  => test.assert(d.months == 1 and d.days == 2 and d.millis == 3)
+                Err(_) => test.fail("it round-trips")
+        Err(_) => test.fail("three non-negative counts")
+
+    test.case("and a negative count has no encoding in unsigned fields")
+    match avrological.duration_bytes(-1, 0, 0)
+        Ok(_)  => test.fail("the fields are unsigned")
+        Err(f) => test.assert(avroerror.kind_name(f.kind) == "bad-parameter")

@@ -1,0 +1,307 @@
+// avrocodec.nv — the compression codecs a container file may use, as
+// VALUES a caller hands in rather than as dependencies.
+//
+// Every body is a `todo()`.  The signatures are the design, and the
+// compiler checks them as claims; see the README for the stamp.
+//
+// THE DECISION THIS MODULE IS.  The Avro specification names three
+// codecs — `null`, `deflate` and `snappy` — and says implementations
+// MAY add others; `zstandard`, `bzip2` and `xz` are all in use in
+// files people have.  `avro.codec` is a string in a file's metadata,
+// not an enum.  There are four ways to meet that and this package
+// takes the fourth.
+//
+//   1. Implement them here.  No: four compression formats inside a
+//      serialisation package is four packages nobody can use
+//      separately.
+//   2. Depend on flate-nv, snappy-nv and zstd-nv.  No, and this is the
+//      close call.  novo's manifest has no optional dependencies
+//      (docs/manifest.md names no such key), so a dependency is a hard
+//      one in every consumer's closure — and ALL THREE OF THOSE ARE
+//      INTERFACE RELEASES TODAY, every body a `todo()`.  A consumer
+//      reading an uncompressed Avro file would resolve, download and
+//      build three packages it cannot call.  Contrast xz-nv, which
+//      takes crc-nv and crypto-nv precisely because both are
+//      implemented.
+//   3. A closed enum of codec names.  No: it refuses a file a newer
+//      writer produced, and `avro.codec` is an open set by
+//      specification.
+//   4. A codec is a VALUE: a name and two named functions.  A caller
+//      wires flate-nv in when it has it, its own implementation when
+//      it has that, and nothing when it needs nothing.  `null` is
+//      built in because it is not compression.
+//
+// NAMED FUNCTIONS AND NOT A CLOSURE, because a lambda that becomes a
+// value is refused at the embedded tier, and because a named function
+// is the shape parquet-nv's `PqDecompressor` already uses on this
+// registry — so a program reading Parquet and Avro wires one pair to
+// both.
+//
+// AND AN UNKNOWN CODEC IS NOT A CORRUPT FILE.  `AvroUnsupportedCodec`
+// carries the name, `avroerror.is_unsupported` answers true for it,
+// and `avrofile.readable_with` asks the question over a file's HEADER
+// so that the refusal happens at open time and names the codec, rather
+// than on block four thousand.
+
+use avroerror
+
+// The codec name for no compression: `"null"`.
+//
+// Required by the specification and the default every writer uses when
+// told nothing.  Built in here, because it is not compression.
+pub const AVRO_CODEC_NULL = "null"
+
+// The codec name for raw DEFLATE: `"deflate"`.
+//
+// RFC 1951, with NO zlib wrapper and no gzip header — which is the
+// trap, because the two readers people reach for first both expect
+// one.  flate-nv's raw format is the one that fits.
+pub const AVRO_CODEC_DEFLATE = "deflate"
+
+// The codec name for Snappy: `"snappy"`.
+//
+// The BLOCK format, and with a four-byte big-endian CRC-32C of the
+// UNCOMPRESSED data appended after the compressed block — which the
+// Snappy format itself does not have and which a caller wiring
+// snappy-nv in has to add.  `snappy_trailer_bytes` is the constant.
+pub const AVRO_CODEC_SNAPPY = "snappy"
+
+// The codec name for Zstandard: `"zstandard"`.
+//
+// Spelled in full, not `"zstd"`.  A file written by a tool that used
+// the short spelling is a file this package will report as
+// unsupported, which is correct and is why the constant is published.
+pub const AVRO_CODEC_ZSTANDARD = "zstandard"
+
+// The codec name for bzip2: `"bzip2"`.
+pub const AVRO_CODEC_BZIP2 = "bzip2"
+
+// The codec name for xz: `"xz"`.
+pub const AVRO_CODEC_XZ = "xz"
+
+// The bytes Snappy's Avro framing adds after a compressed block: 4.
+//
+// A big-endian CRC-32C of the UNCOMPRESSED data.  It is not part of
+// the Snappy format and it is not optional here, and a caller wiring
+// snappy-nv in that forgot it produces files every other Avro reader
+// refuses.
+pub const AVRO_SNAPPY_TRAILER_BYTES = 4
+
+// A codec a caller supplies, as a name and two named functions.
+//
+// ```novo
+// use avrocodec
+//
+// fn main() [io]
+//     println(avrocodec.name_of(avrocodec.null_codec()))
+// ```
+pub struct AvroCodec
+    // The name as it appears in a file's `avro.codec` metadata.
+    name: Str
+    // Answers the decompressed length of `len` bytes at `at`, or a
+    // negative number when the payload is malformed.
+    //
+    // A SEPARATE FUNCTION FROM `run` ON PURPOSE.  A caller that could
+    // only decompress would have to allocate on a size somebody else's
+    // file implied, which is the check this package makes everywhere
+    // else.  It is the same pair parquet-nv's `PqDecompressor` takes,
+    // for the same reason.
+    sized_by: fn(Bytes, Int, Int) -> Int
+    // Decompresses `len` bytes at `at` into a fresh buffer.
+    run: fn(Bytes, Int, Int) -> Bytes
+    // Compresses `len` bytes at `at` into a fresh buffer, for a
+    // writer.  A codec supplied for reading only may point this at a
+    // function that answers an empty buffer, and `can_write` is then
+    // false.
+    pack: fn(Bytes, Int, Int) -> Bytes
+    // Whether `pack` is real.
+    writable: Bool
+
+// The `null` codec: no compression, and built in.
+//
+// The one codec this package implements, because it is not
+// compression: the block's bytes are the block's bytes.
+//
+// ```novo
+// use avrocodec
+//
+// fn main() [io]
+//     println(avrocodec.name_of(avrocodec.null_codec()))
+// ```
+pub fn null_codec() -> AvroCodec []
+    todo("avro-nv.avrocodec.null_codec")
+
+// A read-only codec from a name and two named functions.
+//
+// `AvroBadParameter` for an empty name, and for `"null"`, which is
+// built in and may not be replaced — a file that said `null` and got a
+// caller's function would be a file whose bytes went through something
+// nobody can see.
+//
+// ```novo
+// use std.bytes
+// use avrocodec
+//
+// fn sized(src: Bytes, at: Int, len: Int) -> Int
+//     0
+//
+// fn run(src: Bytes, at: Int, len: Int) -> Bytes
+//     bytes.zeros(0)
+//
+// fn main() [io]
+//     match avrocodec.reader_codec("deflate", sized, run)
+//         Ok(c)  => println(avrocodec.name_of(c))
+//         Err(e) => println(e.message())
+// ```
+pub fn reader_codec(name: Str, sized_by: fn(Bytes, Int, Int) -> Int,
+                    run: fn(Bytes, Int, Int) -> Bytes) -> Result<AvroCodec, AvroFault> []
+    todo("avro-nv.avrocodec.reader_codec")
+
+// A codec that can also write.
+//
+// ```novo
+// use std.bytes
+// use avrocodec
+//
+// fn sized(src: Bytes, at: Int, len: Int) -> Int
+//     0
+//
+// fn run(src: Bytes, at: Int, len: Int) -> Bytes
+//     bytes.zeros(0)
+//
+// fn pack(src: Bytes, at: Int, len: Int) -> Bytes
+//     bytes.zeros(0)
+//
+// fn main() [io]
+//     match avrocodec.codec("deflate", sized, run, pack)
+//         Ok(c)  => println("${avrocodec.can_write(c)}")
+//         Err(e) => println(e.message())
+// ```
+pub fn codec(name: Str, sized_by: fn(Bytes, Int, Int) -> Int, run: fn(Bytes, Int, Int) -> Bytes,
+             pack: fn(Bytes, Int, Int) -> Bytes) -> Result<AvroCodec, AvroFault> []
+    todo("avro-nv.avrocodec.codec")
+
+// No caller-supplied codecs — only `null`.
+//
+// The honest default, and the one that makes `AvroUnsupportedCodec`
+// reachable rather than theoretical.
+//
+// ```novo
+// use avrocodec
+//
+// fn main() [io]
+//     println("${list.len(avrocodec.only_null())}")
+// ```
+pub fn only_null() -> [AvroCodec] []
+    todo("avro-nv.avrocodec.only_null")
+
+// A codec's name.
+//
+// ```novo
+// use avrocodec
+//
+// fn main() [io]
+//     println(avrocodec.name_of(avrocodec.null_codec()))
+// ```
+pub fn name_of(c: AvroCodec) -> Str []
+    todo("avro-nv.avrocodec.name_of")
+
+// Whether a codec can compress as well as decompress.
+//
+// ```novo
+// use avrocodec
+//
+// fn main() [io]
+//     println("${avrocodec.can_write(avrocodec.null_codec())}")
+// ```
+pub fn can_write(c: AvroCodec) -> Bool []
+    todo("avro-nv.avrocodec.can_write")
+
+// The codec of a given name among those supplied, or `None`.
+//
+// `"null"` always answers `Some`, whatever was supplied.
+//
+// ```novo
+// use avrocodec
+//
+// fn main() [io]
+//     match avrocodec.codec_named(avrocodec.only_null(), "deflate")
+//         Some(_) => println("supplied")
+//         None    => println("not supplied")
+// ```
+pub fn codec_named(supplied: [AvroCodec], name: Str) -> ?AvroCodec []
+    todo("avro-nv.avrocodec.codec_named")
+
+// Whether a named codec can be read with what the caller supplied.
+//
+// THE QUESTION TO ASK OVER A FILE HEADER, before reading a single
+// block: a file whose blocks are all `snappy` and a build with no
+// Snappy is a refusal that should happen at open time and name the
+// codec, not on block four thousand.
+//
+// ```novo
+// use avrocodec
+//
+// fn main() [io]
+//     let ok = avrocodec.can_read(avrocodec.only_null(), "snappy")
+//     println("${ok}")
+// ```
+pub fn can_read(supplied: [AvroCodec], name: Str) -> Bool []
+    todo("avro-nv.avrocodec.can_read")
+
+// Whether a name is one the specification or common practice defines.
+//
+// True for the six constants above.  A name outside them is not
+// refused — `avro.codec` is an open set — but a caller building a
+// writer probably meant one of these, and a `"zstd"` that should have
+// been `"zstandard"` is worth catching before a file is written.
+//
+// ```novo
+// use avrocodec
+//
+// fn main() [io]
+//     let known = avrocodec.is_known_name("zstd")
+//     println("${known}")
+// ```
+pub fn is_known_name(name: Str) -> Bool []
+    todo("avro-nv.avrocodec.is_known_name")
+
+// Decompress a block's payload with a codec, bounded.
+//
+// Calls `sized_by` first, compares the answer against `limit`, and
+// only then calls `run` — which is the whole reason the codec is two
+// functions.  `AvroLengthLimitReached` when the declared size is over
+// the bound, and `AvroBadParameter` when `sized_by` answers negative.
+//
+// For `"snappy"` this also checks and strips the four-byte
+// big-endian CRC-32C trailer that Avro's Snappy framing adds.
+//
+// ```novo
+// use std.bytes
+// use avrocodec
+//
+// fn main() [io]
+//     match avrocodec.decompress(avrocodec.null_codec(), bytes.zeros(4), 0, 4, 1048576)
+//         Ok(b)  => println("${bytes.len(b)}")
+//         Err(e) => println(e.message())
+// ```
+pub fn decompress(c: AvroCodec, src: Bytes, at: Int, len: Int,
+                  limit: Int) -> Result<Bytes, AvroFault> []
+    todo("avro-nv.avrocodec.decompress")
+
+// Compress a block's payload with a codec.
+//
+// `AvroBadParameter` for a codec whose `can_write` is false.  For
+// `"snappy"` this appends the four-byte trailer.
+//
+// ```novo
+// use std.bytes
+// use avrocodec
+//
+// fn main() [io]
+//     match avrocodec.compress(avrocodec.null_codec(), bytes.zeros(4), 0, 4)
+//         Ok(b)  => println("${bytes.len(b)}")
+//         Err(e) => println(e.message())
+// ```
+pub fn compress(c: AvroCodec, src: Bytes, at: Int, len: Int) -> Result<Bytes, AvroFault> []
+    todo("avro-nv.avrocodec.compress")

@@ -1,0 +1,77 @@
+[package]
+name        = "avro-nv"
+version     = "0.0.1"
+description = "Apache Avro 1.11 for novo-lang, with nothing performed: the schema language parsed once into a value with its naming and union rules checked, schema RESOLUTION as a typed plan built before a byte is decoded, the binary encoding both ways over a caller-bounded cursor, the object container file with its sync marker and skippable blocks, and single-object encoding with the CRC-64-AVRO Rabin fingerprint.  Compression codecs are values a caller hands in — named functions, not dependencies — because `avro.codec` is an open set and the registry's compression rows are interfaces.  Interface only — every body is a todo()."
+license     = "Apache-2.0"
+
+# An INTERFACE release: every `pub fn` body is a `todo()`, so the
+# signatures and the effect rows are published and nothing is
+# implemented.  `novo pkg publish` recognises the shape and requires
+# both the draft stability and the 0.0.x version; the first
+# implementation is the 0.1.0 published over it.
+stability   = "draft"
+
+# `core`.  Avro is a JSON schema, a zigzag varint and a byte copy:
+# arithmetic over bytes and text the caller already holds.  Nothing is
+# read, nothing is written, and nothing is generated.
+#
+# Two things a `core` package may not do, and how each arrives instead:
+#
+#   RANDOMNESS.  A container file's sixteen-byte sync marker must be
+#   random — it is what lets a reader split a five-gigabyte file at an
+#   arbitrary offset and find the next block — and `core` has no
+#   `[rand]`.  So `avrofile.writer` TAKES the marker, and the caller
+#   spends its own `[rand]` once, where it is visible.  The same shape
+#   jwt-nv uses for the clock.
+#
+#   COMPRESSION.  See `[dependencies]`.
+layer       = "core"
+
+category    = "encoding"
+
+tags        = ["avro", "serialization", "schema", "schema-evolution", "encoding", "big-data", "sans-io"]
+repository  = "https://github.com/novolang/avro-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.9.0"
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+
+[docs.pages]
+"README.md" = "Avro, with a schema mismatch caught before a byte is decoded"
+
+[dependencies]
+# NOTHING.  The stdlib and nothing else, and the decision worth writing
+# down is the one about compression codecs.
+#
+# The Avro specification names three — `null`, `deflate` and `snappy` —
+# and says implementations MAY add others; `zstandard`, `bzip2` and
+# `xz` are all in files people have.  `avro.codec` is a STRING in a
+# file's metadata, not an enum.  Four ways to meet that, and this
+# package takes the fourth:
+#
+#   1. Implement them here.  Four compression formats inside a
+#      serialisation package is four packages nobody can use
+#      separately.
+#   2. Depend on flate-nv, snappy-nv and zstd-nv.  This is the close
+#      call, and the answer is no twice over.  novo's manifest has no
+#      optional dependencies (docs/manifest.md names no such key), so a
+#      dependency is a hard one in EVERY consumer's closure — and all
+#      three of those are INTERFACE releases today, every body a
+#      `todo()`.  A consumer reading an uncompressed Avro file would
+#      resolve, download and build three packages it cannot call.
+#      (Contrast xz-nv, which takes crc-nv and crypto-nv precisely
+#      because both are implemented.)
+#   3. A closed enum of codec names.  Refuses a file a newer writer
+#      produced, and the specification says the set is open.
+#   4. A codec is a VALUE: a name and named functions, which is what
+#      `avrocodec.AvroCodec` is.  A caller wires flate-nv in when it
+#      has it, its own implementation when it has that, and nothing
+#      when it needs nothing.  `null` is built in, because it is not
+#      compression.
+#
+# parquet-nv's `PqDecompressor` is the same shape on this registry, so
+# a program reading Parquet and Avro wires one pair of named functions
+# to both.  The same reasoning covers the MD5 and SHA-256 schema
+# fingerprints, which `avrofp.wide_fingerprint` takes as a function
+# rather than pulling crypto-nv in for a path most callers never use.

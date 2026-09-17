@@ -1,0 +1,298 @@
+// avrovalue.nv — the value an Avro datum decodes to, and the reason it
+// is one type rather than a generic JSON value.
+//
+// Every body is a `todo()`.  The signatures are the design, and the
+// compiler checks them as claims; see the README for the stamp.
+//
+// WHY THIS PACKAGE DECLARES ITS OWN VALUE TYPE.  A decoded Avro datum
+// is not JSON and does not fit a JSON value without losing things that
+// matter: `bytes` and `string` are different types with the same
+// encoding, `int` and `long` are different widths, `float` and `double`
+// are different precisions, an `enum` is a symbol and not a string, a
+// `fixed` is not a `bytes`, and a union value remembers WHICH BRANCH
+// it came from.  A decoder that answered a JSON value would throw all
+// six away, and a writer round-tripping through it would produce a
+// different file.
+//
+// AND THE VALUE CARRIES ITS BRANCH.  `AvroUnionValue` holds the branch
+// index beside the value, because a union of `["null","string"]` and a
+// union of `["string","null"]` encode the same string differently, and
+// a value that had forgotten which union it belonged to could not be
+// written back.
+//
+// ONE ARM PER TYPE, AND NOT ONE MORE.  There is no `AvroAny` and no
+// untyped escape: a value is always one of the fourteen, and the
+// schema says which.  That is what lets `avrobinary.encode` be total —
+// given a schema and a value of it, there is no case where it does not
+// know what to write.
+
+use avroerror
+use avroschema
+
+// A decoded Avro datum.
+//
+// ```novo
+// use avrovalue
+//
+// fn main() [io]
+//     println(avrovalue.kind_name(avrovalue.long_value(7)))
+// ```
+pub enum AvroValue
+    // The one value of the `null` type.
+    AvroNullValue
+    // A boolean.
+    AvroBoolValue(b: Bool)
+    // A 32-bit signed integer.
+    AvroIntValue(n: Int)
+    // A 64-bit signed integer.  A separate arm from `AvroIntValue`
+    // because the two have different encodings and because a schema
+    // that says `int` may not be handed a value that does not fit one.
+    AvroLongValue(n: Int)
+    // A 32-bit float.
+    AvroFloatValue(x: Float)
+    // A 64-bit double.
+    AvroDoubleValue(x: Float)
+    // A length-prefixed byte sequence.
+    AvroBytesValue(b: Bytes)
+    // A length-prefixed byte sequence meant as UTF-8.  A separate arm
+    // from `AvroBytesValue` although the encodings are identical,
+    // because the schema distinguishes them and a round trip must.
+    AvroStrValue(s: Str)
+    // A record: one value per field, in the schema's field order.
+    AvroRecordValue(fields: [AvroValue])
+    // An enum: the symbol's INDEX, not its text.  The index is the
+    // encoding, and resolution maps a writer's index to a reader's.
+    AvroEnumValue(index: Int)
+    // An array.
+    AvroArrayValue(items: [AvroValue])
+    // A map: keys and values in two parallel lists, in the order the
+    // file carried them.
+    //
+    // Two lists rather than a pair list because Avro's map keys are
+    // always strings and a caller looking one up wants the keys
+    // without walking pairs.  The ORDER is kept because a round trip
+    // must reproduce the file, and Avro does not say a map is sorted.
+    AvroMapValue(keys: [Str], values: [AvroValue])
+    // A union: which branch, and the value of that branch.
+    //
+    // THE ARM THAT CARRIES THE BRANCH.  A union of `["null","string"]`
+    // and one of `["string","null"]` encode the same string
+    // differently, so a value that forgot its branch could not be
+    // written back.
+    AvroUnionValue(branch: Int, value: [AvroValue])
+    // A fixed-length byte sequence, with no length prefix on the wire.
+    AvroFixedValue(b: Bytes)
+
+// A short, stable name for a value's kind: `"long"`, `"record"`,
+// `"union"`.
+//
+// ```novo
+// use avrovalue
+//
+// fn main() [io]
+//     println(avrovalue.kind_name(AvroNullValue))
+// ```
+pub fn kind_name(v: AvroValue) -> Str []
+    todo("avro-nv.avrovalue.kind_name")
+
+// A `long` value.
+//
+// ```novo
+// use avrovalue
+//
+// fn main() [io]
+//     println(avrovalue.kind_name(avrovalue.long_value(7)))
+// ```
+pub fn long_value(n: Int) -> AvroValue []
+    todo("avro-nv.avrovalue.long_value")
+
+// A `string` value.
+//
+// ```novo
+// use avrovalue
+//
+// fn main() [io]
+//     println(avrovalue.kind_name(avrovalue.str_value("hello")))
+// ```
+pub fn str_value(s: Str) -> AvroValue []
+    todo("avro-nv.avrovalue.str_value")
+
+// A union value: a branch index and the value on it.
+//
+// ```novo
+// use avrovalue
+//
+// fn main() [io]
+//     println(avrovalue.kind_name(
+//         avrovalue.union_value(1, avrovalue.str_value("hello"))))
+// ```
+pub fn union_value(branch: Int, v: AvroValue) -> AvroValue []
+    todo("avro-nv.avrovalue.union_value")
+
+// The value inside a union, or `None` for a value that is not a union.
+//
+// ```novo
+// use avrovalue
+//
+// fn main() [io]
+//     match avrovalue.union_inner(avrovalue.union_value(0, AvroNullValue))
+//         Some(v) => println(avrovalue.kind_name(v))
+//         None    => println("not a union")
+// ```
+pub fn union_inner(v: AvroValue) -> ?AvroValue []
+    todo("avro-nv.avrovalue.union_inner")
+
+// The value of a record's field by name, given the record's schema.
+//
+// Records are encoded positionally and decoded into a positional list,
+// so reading a field by name needs the schema.  Taking it here rather
+// than storing names in every record value is what keeps a
+// million-record decode from carrying a million copies of the same
+// field names.
+//
+// ```novo
+// use avrovalue
+// use avroschema
+//
+// fn main() [io]
+//     match avroschema.parse("\"int\"")
+//         Ok(s) =>
+//             match avrovalue.field_of(avrovalue.long_value(1), s, "id")
+//                 Some(v) => println(avrovalue.kind_name(v))
+//                 None    => println("no such field")
+//         Err(e) => println(e.message())
+// ```
+pub fn field_of(v: AvroValue, s: AvroSchema, name: Str) -> ?AvroValue []
+    todo("avro-nv.avrovalue.field_of")
+
+// The value of a map's key, or `None`.
+//
+// ```novo
+// use avrovalue
+//
+// fn main() [io]
+//     match avrovalue.map_get(avrovalue.long_value(1), "k")
+//         Some(v) => println(avrovalue.kind_name(v))
+//         None    => println("not a map, or no such key")
+// ```
+pub fn map_get(v: AvroValue, key: Str) -> ?AvroValue []
+    todo("avro-nv.avrovalue.map_get")
+
+// Whether a value fits a schema, checked all the way down.
+//
+// `AvroBadSchemaShape`, which `avroerror.is_schema_error` answers
+// true for, naming the path where it did not — a record
+// with the wrong number of fields, an `int` value under a `string`
+// schema, a union branch outside the union, an `enum` index outside
+// the symbols, a `fixed` of the wrong length.
+//
+// THE CALL A WRITER MAKES BEFORE IT ENCODES.  Avro's encoding has no
+// markers, so a value that did not fit its schema would be written as
+// bytes nobody can read back and nothing would say so.
+//
+// ```novo
+// use avrovalue
+// use avroschema
+//
+// fn main() [io]
+//     match avroschema.parse("\"long\"")
+//         Ok(s) =>
+//             match avrovalue.check(avrovalue.long_value(7), s)
+//                 Ok(_)  => println("fits")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn check(v: AvroValue, s: AvroSchema) -> Result<Int, AvroFault> []
+    todo("avro-nv.avrovalue.check")
+
+// The value a field default's JSON text denotes, under a schema.
+//
+// The specification's default encoding, which is NOT the same as the
+// JSON encoding of Avro data: a `bytes` default is a string whose code
+// points are the byte values, and a union's default is a value of its
+// FIRST branch with no branch name around it.  Both are traps, and
+// both live here rather than in a caller.
+//
+// `AvroBadDefault` when the JSON does not fit.
+//
+// ```novo
+// use avrovalue
+// use avroschema
+//
+// fn main() [io]
+//     match avroschema.parse("\"long\"")
+//         Ok(s) =>
+//             match avrovalue.from_default_json("0", s)
+//                 Ok(v)  => println(avrovalue.kind_name(v))
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn from_default_json(json: Str, s: AvroSchema) -> Result<AvroValue, AvroFault> []
+    todo("avro-nv.avrovalue.from_default_json")
+
+// The value as Avro's JSON encoding, under a schema.
+//
+// Not the same as the default encoding above: here a union value is
+// `{"<branch type name>": <value>}` except for `null`, which is bare
+// `null`, and `bytes` is a string whose code points are the byte
+// values.  The form `avro-tools tojson` writes.
+//
+// ```novo
+// use avrovalue
+// use avroschema
+//
+// fn main() [io]
+//     match avroschema.parse("\"long\"")
+//         Ok(s) =>
+//             match avrovalue.to_json(avrovalue.long_value(7), s)
+//                 Ok(j)  => println(j)
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn to_json(v: AvroValue, s: AvroSchema) -> Result<Str, AvroFault> []
+    todo("avro-nv.avrovalue.to_json")
+
+// A value from Avro's JSON encoding, under a schema.
+//
+// ```novo
+// use avrovalue
+// use avroschema
+//
+// fn main() [io]
+//     match avroschema.parse("\"long\"")
+//         Ok(s) =>
+//             match avrovalue.from_json("7", s)
+//                 Ok(v)  => println(avrovalue.kind_name(v))
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn from_json(json: Str, s: AvroSchema) -> Result<AvroValue, AvroFault> []
+    todo("avro-nv.avrovalue.from_json")
+
+// Compare two values under a schema, in the specification's sort
+// order.
+//
+// Answers a negative number, zero or a positive one.  The order is not
+// the obvious one: a record compares field by field in the order the
+// fields are DECLARED, skipping fields whose `order` is `"ignore"` and
+// reversing those whose `order` is `"descending"`; an enum compares by
+// symbol INDEX and not alphabetically; a union compares by branch
+// index first.
+//
+// Published because Avro data is sorted by this order in every system
+// that sorts it, and a caller that used its own would disagree with
+// every other reader of the same file.
+//
+// ```novo
+// use avrovalue
+// use avroschema
+//
+// fn main() [io]
+//     match avroschema.parse("\"long\"")
+//         Ok(s) =>
+//             println("${avrovalue.compare(avrovalue.long_value(1),
+//                                          avrovalue.long_value(2), s)}")
+//         Err(e) => println(e.message())
+// ```
+pub fn compare(a: AvroValue, b: AvroValue, s: AvroSchema) -> Int []
+    todo("avro-nv.avrovalue.compare")
