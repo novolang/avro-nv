@@ -6,11 +6,6 @@ Data is written with a schema, and read with a schema that may be a different
 one. This package reads and writes it in novo-lang, and performs no input or
 output itself.
 
-**Status: NOT IMPLEMENTED — interface only.** Every function is declared with
-its full signature, but every body is a `todo()` that panics when called. The
-package is published so its design can be reviewed and depended on before it is
-implemented. Version 0.1.0 will be the first working release.
-
 ## What Avro is
 
 An Avro **schema** is JSON. It names one of eight *primitive* types — null,
@@ -88,15 +83,7 @@ fn main() [io]
                         Ok(plan) => println(avroresolve.describe(plan))
 ```
 
-Build and test with:
-
-```
-novo pkg build                  # type- and effect-check the package
-novo test --isolate tests/avroresolve_tests.nv
-```
-
-Today `novo test` fails on purpose: every assertion reaches
-`not implemented: avro-nv.<module>.<fn>`.
+The program prints `` `long` is promoted from int to long. ``
 
 ## What the package contains
 
@@ -121,6 +108,9 @@ number or waits for anything.
 `avrofile.read_all`.** It reads the header, checks the codec, and walks every
 block.
 
+**You want the blocks one at a time: `avrofile.reader`, then
+`avrofile.read_block` or `avrofile.skip_block` until `avrofile.at_end`.**
+
 **You want the file's own schema first: `avrofile.read_header`.** The header
 carries it, and `avrofile.readable_with` says whether the codecs you supplied
 can read the blocks.
@@ -138,7 +128,7 @@ and `avrobinary.decode`.** The first says which schema, the second reads the
 datum.
 
 **You are writing a container file: `avrofile.writer`.** You supply the
-sixteen-byte sync marker; see rule 4.
+sixteen-byte sync marker; see rule 5.
 
 **You want the low-level encoding: `avrobinary`.** `read_long`, `write_long`,
 `skip` and the cursor.
@@ -153,56 +143,62 @@ sixteen-byte sync marker; see rule 4.
    `avroresolve.resolve` either answers a plan or names the specification rule
    that failed. `avrofile.reader_with_schema` runs it at open time. A decoder
    that resolved as it went would already have produced wrong values by the
-   time it noticed.
-3. **Promotions go one way only.** `int` widens to `long`, `float` or `double`;
+   time it noticed. The specification reports a writer's union branch or enum
+   symbol that the reader cannot take only when such a value is read; this
+   package refuses the pair of schemas instead.
+3. **Aliases belong to the reader.** A reader that renamed a record, enum,
+   fixed or field lists the old name in `aliases`, and the writer's data is
+   read under the new name (specification section "Aliases"). An alias on the
+   writer's schema does nothing.
+4. **Promotions go one way only.** `int` widens to `long`, `float` or `double`;
    `long` to `float` or `double`; `float` to `double`; and `string` and `bytes`
    convert both ways because their encodings are identical. Nothing narrows —
    Avro will not truncate a value silently.
-4. **The container file's sync marker must be random, and this package cannot
+5. **The container file's sync marker must be random, and this package cannot
    make one.** It is sixteen bytes at the end of every block, and a reader
    splitting a large file scans for it — so a marker that appeared inside
    somebody's data would split a file in the wrong place. This package has no
    `[rand]`, so `avrofile.writer` takes the marker and the caller spends its own
    randomness where it is visible.
-5. **A compression codec is a value you supply, not a dependency.**
+6. **A compression codec is a value you supply, not a dependency.**
    `avro.codec` is a string in a file's metadata and the specification says the
    set is open. `avrocodec.reader_codec` takes a name and two named functions:
    one that answers the decompressed size, one that decompresses. `null` is
    built in. A file naming a codec you did not supply is
    `AvroUnsupportedCodec`, which is not a corrupt file — ask
    `avrofile.readable_with` over the header, at open time.
-6. **Avro's `snappy` is not plain Snappy.** It is a Snappy block with a
+7. **Avro's `snappy` is not plain Snappy.** It is a Snappy block with a
    four-byte big-endian CRC-32C of the *uncompressed* data appended, which the
    Snappy format itself does not have. And Avro's `deflate` is raw DEFLATE with
    no zlib wrapper and no gzip header.
-7. **Decoding is bounded, and bounded by default.** A `bytes` length is a
+8. **Decoding is bounded, and bounded by default.** A `bytes` length is a
    varint, so five bytes of input can declare a two-gigabyte string.
    `avrobinary.default_limits()` allows 64 MiB per value, 16 million items per
    block and 64 levels of nesting; `avrobinary.no_limits()` is there for a
    caller decoding what it wrote.
-8. **An unusable logical-type annotation is ignored, not refused.** The
+9. **An unusable logical-type annotation is ignored, not refused.** The
    specification requires it: the implementation uses the underlying type and
    carries on, so a reader that has never heard of `timestamp-millis` still
    reads the field as a `long`. `avrological.check` is the separate call that
    *tells* you an annotation you wrote is being ignored.
-9. **A `timestamp` and a `local-timestamp` are not the same thing, and the
+10. **A `timestamp` and a `local-timestamp` are not the same thing, and the
    bytes cannot tell you which.** Both are a `long` of the same magnitude; one
    is an instant in UTC and the other is a wall clock reading with no zone.
    `avrological.is_instant` is the question.
-10. **A decimal is two's complement and big-endian; a duration is unsigned and
+11. **A decimal is two's complement and big-endian; a duration is unsigned and
     little-endian.** A reader that treated a decimal's bytes as unsigned reads
     every negative number wrong. `duration` is the only little-endian logical
     type in the specification.
-11. **CRC-64-AVRO is not a standard CRC-64.** It is a 64-bit Rabin fingerprint
+12. **CRC-64-AVRO is not a standard CRC-64.** It is a 64-bit Rabin fingerprint
     whose polynomial *and* initial value are `0xC15D213AA4D7A795`. A port that
     reached for CRC-64/ECMA-182 or CRC-64/XZ would produce fingerprints no
     other Avro reader recognises. The specification's own check value —
     `0x63DD24E7CC258F8A` for the canonical form `"null"` — is asserted in
     `tests/avroresolve_tests.nv`.
-12. **A union's branch order is part of its meaning.** A branch is encoded as
+13. **A union's branch order is part of its meaning.** A branch is encoded as
     its index, so adding a branch to the front of a reader's union changes what
     every old record reads as. Adding one to the back does not.
-13. **Every public type, variant and module name in this package starts `Avro`
+14. **Every public type, variant and module name in this package starts `Avro`
     or `avro`.** Type and variant names are unique across a whole program,
     dependencies included, so two packages that both declared `Schema` could not
     be used together. `Schema`, `Field`, `Record`, `Codec` and `Fault` are all
@@ -213,7 +209,7 @@ sixteen-byte sync marker; see rule 4.
 - **Code generation.** No `.avsc` compiler, no generated record types. A schema
   is a value at run time and a datum is an `AvroValue`. A generator is a
   separate program that can be written on top of `avroschema`.
-- **Compression codecs.** See rule 5.
+- **Compression codecs.** See rule 6.
 - **The RPC protocol.** Avro defines a protocol — messages, handshakes,
   transports — beside the data format. It is `[net]` work, this package is
   `core`, and it belongs in a package on top of this one.
@@ -252,34 +248,32 @@ they are good — `avro.schema`, `avro.codec`, the Parsing Canonical Form, the
 four resolution actions — so a reader with that page open recognises what they
 are.
 
-## Test vectors
+## Tests
 
-The Avro project's `share/test` directory is the oracle: it ships schemas, the
-canonical form and fingerprint of each, and container files written by the Java
-implementation with each codec. When the bodies land, every schema's canonical
-form and CRC-64-AVRO fingerprint are compared, and every container file is read
-and its records compared, as a generated run beside the three suites in
-`tests/`.
+```bash
+novo test tests/avroschema_tests.nv         # the fourteen types, names, defaults, logical types
+novo test tests/avroschemaedge_tests.nv     # every refusal of the parser, and the written form
+novo test tests/avrobinary_tests.nv         # zigzag varints, blocks, the value type, the limits
+novo test tests/avrovalueedge_tests.nv      # value checks, both JSON forms, sort order, damaged input
+novo test tests/avroresolve_tests.nv        # resolution, codecs, the container file, fingerprints
+novo test tests/avroresolveedge_tests.nv    # every resolution rule, describe, logical types
+novo test tests/avrofileedge_tests.nv       # files written and read back, damaged files, codecs
+novo test tests/avroerror_tests.nv          # every fault kind, its name and its sentence
+novo test tests/differential_tests.nv       # against the Python Avro libraries
+bash tests/coverage.sh                      # line coverage over src/, merged across the suites
+```
 
-Two numbers have their own oracle and are asserted today: the specification's
-worked fingerprints `0x63DD24E7CC258F8A` for `"null"` and `0x8F014872634503C7`
-for `"string"`.
+The differential suite is written by `tools/differential.py` from two
+independent implementations: the Apache Avro project's Python library,
+version 1.11.3, and fastavro, version 1.12.2. It checks the Parsing Canonical
+Form and the CRC-64-AVRO fingerprint of 17 schemas, the binary encoding of
+72 datums both ways, 80 datums read through a different reader schema, and 9
+container files read record for record.
 
-## Implementation status
-
-Every function is a `todo()`. Every type is declared.
-
-| Module | Implemented |
-| --- | --- |
-| `avroschema` — `AvroType`, `AvroField`, `AvroSchema` and their eighteen functions | no |
-| `avroresolve` — `AvroFieldAction`, `AvroResolveStep`, `AvroResolution` and their nine functions | no |
-| `avrobinary` — `AvroCursor`, `AvroLimits`, `AvroLongRead`, `AvroBlockCount` and their fifteen functions | no |
-| `avrovalue` — `AvroValue` and its twelve functions | no |
-| `avrological` — `AvroLogical`, `AvroDurationValue` and their eleven functions | no |
-| `avrofile` — `AvroFileHeader`, `AvroBlockHeader`, `AvroReader`, `AvroBlock`, `AvroWriter`, `AvroAppended` and their nineteen functions | no |
-| `avrocodec` — `AvroCodec` and its eleven functions | no |
-| `avrofp` — `AvroSingleObject` and its nine functions | no |
-| `avroerror` — `AvroWhere`, `AvroFaultKind`, `AvroFault` and their eleven functions | no |
+The specification's own check values are asserted in
+`tests/avroresolve_tests.nv`: `0x63DD24E7CC258F8A` for `"null"` and
+`0x8F014872634503C7` for `"string"`. The CRC-32C of Avro's `snappy` framing is
+checked against the RFC 3720 check value `E3069283` for `123456789`.
 
 ## Licence
 
