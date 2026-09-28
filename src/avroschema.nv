@@ -1,55 +1,56 @@
 // avroschema.nv — the schema language: eight primitives, six complex
 // types, and the naming rules that make two schemas comparable.
 //
-// Every body is a `todo()`.  The signatures are the design, and the
-// compiler checks them as claims; see the README for the stamp.
-//
-// AN AVRO SCHEMA IS JSON, and it is the only self-description the data
+// An Avro schema is JSON, and it is the only self-description the data
 // has.  The binary encoding carries no field tags, no lengths on a
-// record and no terminators, so the schema is not documentation — it
-// is the parser.  Everything in this module exists so that the schema
-// is a VALUE, parsed once and checked once, rather than a string a
-// decoder re-reads per record.
+// record and no terminators, so the schema is what a decoder follows.
+// This module parses it once into a value and checks it once.
 //
-// EIGHT PRIMITIVES: null, boolean, int, long, float, double, bytes,
-// string.  `int` and `long` are 32- and 64-bit signed; `bytes` and
-// `string` differ only in whether the bytes are meant as UTF-8, and
-// they are encoded identically.
+// The eight primitives are null, boolean, int, long, float, double,
+// bytes and string.  `int` and `long` are 32-bit and 64-bit signed.
+// `bytes` and `string` differ only in whether the bytes are meant as
+// UTF-8, and they are encoded identically.
 //
-// SIX COMPLEX TYPES: record, enum, array, map, union, fixed.  Three of
-// them — record, enum and fixed — are NAMED, and a name is the thing
-// two schemas are matched by when a reader and a writer are resolved.
+// The six complex types are record, enum, array, map, union and fixed.
+// Record, enum and fixed are named, and a name is what two schemas are
+// matched by when a reader and a writer are resolved.
 //
-// A FULL NAME IS A NAMESPACE AND A NAME, and the rules for producing
-// one are the part of the specification everybody gets wrong.  A name
-// containing a dot is already a full name and its namespace attribute
-// is IGNORED.  Otherwise the namespace attribute applies.  Otherwise
-// the enclosing schema's namespace applies — and "enclosing" means the
-// nearest enclosing NAMED type, not the nearest enclosing schema, so a
-// record inside an array inside a record inherits from the record.
-// `full_name_in` is that rule written once.
+// A full name is a namespace and a name (specification section
+// "Names").  A name containing a dot is already a full name, and its
+// namespace attribute is ignored.  Otherwise the namespace attribute
+// applies.  Otherwise the namespace of the nearest enclosing named
+// type applies, so a record inside an array inside a record takes the
+// outer record's namespace.  `full_name_in` is that rule.
 //
-// A UNION MAY NOT CONTAIN A UNION, and may not contain the same type
-// twice — except that two named types with different names are
-// different types.  Both rules are checked at parse, because a union
-// that broke either would make the branch index ambiguous and the
-// binary encoding is nothing but that index.
+// A union may not contain a union, and may not contain the same type
+// twice, although two named types with different names are different
+// types.  Both rules are checked at parse, because the binary encoding
+// of a union is the branch index and an ambiguous index cannot be
+// read.
 //
-// THE PARSING CANONICAL FORM IS WHAT A FINGERPRINT IS TAKEN OVER.  It
-// strips everything that does not change how data is read — docs,
-// aliases, defaults, and every attribute the specification does not
-// name — resolves every name to its full name, and puts the remaining
-// attributes in a fixed order.  Two schemas with the same canonical
-// form read the same bytes the same way, and that is the whole basis
-// of single-object encoding.
+// A named type may be used again after its definition by writing its
+// name.  Such a use is parsed into a copy of the definition.  A use
+// inside the type's own definition, which is how a recursive type such
+// as a linked list is written, cannot be a copy: it is parsed into a
+// reference, a schema whose `is_reference` is true and which carries
+// only the kind and the full name.  The definition is the enclosing
+// named type of that full name, and every function in this package
+// that walks a schema looks it up there.
+//
+// The Parsing Canonical Form is what a fingerprint is taken over.  It
+// keeps only the attributes that change how data is read, writes every
+// name as its full name, and puts the attributes in a fixed order with
+// no whitespace.  Two schemas with the same canonical form read the
+// same bytes the same way.
 
+use std.json
 use avroerror
 
 // Which of the fourteen types a schema is.
 //
-// Prefixed, because a variant is constructed by NAME across a whole
-// program and `Record`, `Array`, `Map` and `Union` are names four
-// other packages will want.
+// Prefixed, because a variant is constructed by name across a whole
+// program and `Record`, `Array`, `Map` and `Union` are names other
+// packages will want.
 //
 // ```novo
 // use avroschema
@@ -72,7 +73,7 @@ pub enum AvroType
     AvroDouble
     // A length-prefixed byte sequence.
     AvroBytes
-    // A length-prefixed byte sequence meant as UTF-8.  Encoded
+    // A length-prefixed byte sequence meant as UTF-8.  It is encoded
     // identically to `AvroBytes`, which is why a reader and a writer
     // may resolve one to the other.
     AvroString
@@ -85,8 +86,8 @@ pub enum AvroType
     AvroArray
     // A string-keyed map, encoded in blocks like an array.
     AvroMap
-    // A choice between two or more schemas, encoded as the branch
-    // index and then that branch.
+    // A choice between schemas, encoded as the branch index and then
+    // that branch.
     AvroUnion
     // A named fixed-length byte sequence, with no length prefix.
     AvroFixed
@@ -108,25 +109,23 @@ pub struct AvroField
     name: Str
     // The field's schema.
     schema: AvroSchema
-    // The field's default, as the JSON text the schema carried, or
-    // `""` when it has none.
+    // The field's default, as compact JSON text, or `""` when it has
+    // none.
     //
-    // KEPT AS TEXT rather than as a value, because a default is only
-    // ever used through resolution and turning it into a value needs
-    // the READER's schema, which the writer's schema does not have.
-    // `avroresolve` is where it becomes one.
+    // It is kept as text because a default is used through
+    // resolution, and turning it into a value needs the reader's
+    // schema.  `avroresolve` decodes it once, per plan.
     default_json: Str
     // Whether the field carries a default at all.  A field whose
-    // default is JSON `null` has one; the empty string above cannot
-    // tell those apart, so this is the question to ask.
+    // default is JSON `null` has one, and `default_json` is then
+    // `"null"`.
     has_default: Bool
-    // The field's aliases, which resolution matches a writer's field
-    // name against.
+    // The field's aliases.  Resolution matches a writer's field name
+    // against the reader field's name and aliases.
     aliases: [Str]
     // The field's `order` attribute: `"ascending"`, `"descending"` or
-    // `"ignore"`.  Carried because it is part of the schema and
-    // affects the specification's sort order, which a caller sorting
-    // Avro data has to honour.
+    // `"ignore"`.  It decides the specification's sort order, which
+    // `avrovalue.compare` follows.
     order: Str
 
 // A parsed Avro schema.
@@ -142,57 +141,92 @@ pub struct AvroField
 pub struct AvroSchema
     // Which of the fourteen types this is.
     kind: AvroType
-    // The full name, for `AvroRecord`, `AvroEnum` and `AvroFixed`;
-    // `""` for the rest.  Already resolved against the enclosing
+    // The full name, for `AvroRecord`, `AvroEnum` and `AvroFixed`, and
+    // `""` for the rest.  It is already resolved against the enclosing
     // namespace, so a comparison is a string comparison.
     full_name: Str
-    // The aliases, as full names.  Resolution matches a reader's name
-    // against a writer's name OR any of the writer's aliases.
+    // The aliases, as full names.  Resolution matches the writer's
+    // name against the reader's name or any of the reader's aliases.
     aliases: [Str]
-    // The `doc` attribute, or `""`.  Carried so that a schema can be
-    // written back out, and stripped from the canonical form.
+    // The `doc` attribute, or `""`.  It is kept so that a schema can be
+    // written back out, and left out of the canonical form.
     doc: Str
     // The fields, for `AvroRecord`.  Empty otherwise.
     fields: [AvroField]
-    // The symbols, for `AvroEnum`.  Empty otherwise.  Their ORDER is
+    // The symbols, for `AvroEnum`.  Empty otherwise.  Their order is
     // the encoding: a symbol is written as its index here.
     symbols: [Str]
-    // The `default` symbol of an `AvroEnum`, or `""`.
-    //
-    // What a reader falls back to when the writer wrote a symbol the
-    // reader does not have — the one place Avro lets an enum grow
-    // without breaking every existing reader.
+    // The `default` symbol of an `AvroEnum`, or `""`.  A reader uses it
+    // for a symbol the writer wrote and the reader does not have.
     enum_default: Str
-    // The element schema, for `AvroArray`; the value schema, for
-    // `AvroMap`.  A one-element list, or empty.
+    // The element schema, for `AvroArray`, and the value schema, for
+    // `AvroMap`: a one-element list.  Empty otherwise.
     element: [AvroSchema]
-    // The branches, for `AvroUnion`.  Empty otherwise.  Their ORDER
-    // is the encoding: a branch is written as its index here.
+    // The branches, for `AvroUnion`.  Empty otherwise.  Their order is
+    // the encoding: a branch is written as its index here.
     branches: [AvroSchema]
     // The byte count, for `AvroFixed`.  Zero otherwise.
     fixed_size: Int
-    // The logical-type annotation, or `""` — `"decimal"`, `"uuid"`,
-    // `"date"`, `"timestamp-millis"`.  `avrological` is what turns it
-    // into a checked value.
+    // The logical-type annotation, or `""`: `"decimal"`, `"uuid"`,
+    // `"date"`, `"timestamp-millis"` and the others.  `avrological`
+    // turns it into a checked value.
     logical: Str
     // The `precision` of a `decimal`, or 0.
     precision: Int
     // The `scale` of a `decimal`, or 0.
     scale: Int
+    // Whether this is a use of a named type inside that type's own
+    // definition.  Such a schema carries its kind and full name and
+    // nothing else, and its definition is the enclosing named type of
+    // the same full name.
+    is_reference: Bool
+
+// The named types a parse has met: each full name, and its schema.  A
+// type still being defined holds a reference in `defs` until its
+// definition is complete.
+struct Names
+    var full: [Str]
+    var defs: [AvroSchema]
+
+// A schema of a kind, with every other attribute empty.
+fn bare(kind: AvroType) -> AvroSchema
+    built(kind, "", [], "", [], [], "", [], [], 0)
+
+// A schema from its attributes, with no logical type.
+fn built(kind: AvroType, full: Str, aliases: [Str], doc: Str, fields: [AvroField], symbols: [Str],
+         enum_default: Str, element: [AvroSchema], branches: [AvroSchema], size: Int) -> AvroSchema
+    AvroSchema { kind: kind, full_name: full, aliases: aliases, doc: doc, fields: fields,
+                 symbols: symbols, enum_default: enum_default, element: element,
+                 branches: branches, fixed_size: size, logical: "", precision: 0, scale: 0,
+                 is_reference: false }
+
+// A reference to a named type from inside its own definition.
+fn reference_to(kind: AvroType, full: Str) -> AvroSchema
+    AvroSchema { kind: kind, full_name: full, aliases: [], doc: "", fields: [], symbols: [],
+                 enum_default: "", element: [], branches: [], fixed_size: 0, logical: "",
+                 precision: 0, scale: 0, is_reference: true }
+
+// A field with a default, as compact JSON text.
+fn with_default_text(f: AvroField, text: Str) -> AvroField
+    AvroField { name: f.name, schema: f.schema, default_json: text, has_default: true,
+                aliases: f.aliases, order: f.order }
+
+// A schema fault at a path.
+fn bad(kind: AvroFaultKind, path: Str) -> AvroFault
+    avroerror.fault(kind, avroerror.at_path(path))
 
 // Parse a schema from its JSON text.
 //
-// `AvroSchemaNotJson` when the text is not JSON, `AvroUnknownType`
-// when it names a type that is neither a primitive, a complex type nor
-// a name defined earlier, `AvroDuplicateName` for a name defined
-// twice, `AvroBadName` for a name the format does not allow, and
-// `AvroBadDefault` for a field default that does not fit its type.
-// `avroerror.is_schema_error` answers true for every one of them: they
-// are a developer's problem, not a file's.
+// Every fault it answers is one `avroerror.is_schema_error` answers
+// true for.  `AvroSchemaNotJson` when the text is not JSON,
+// `AvroUnknownType` when it names a type that is neither a primitive,
+// a complex type nor a name defined earlier, `AvroDuplicateName` for a
+// name defined twice, `AvroBadName` for a name the format does not
+// allow, `AvroBadDefault` for a field default that does not fit its
+// type, and `AvroBadSchemaShape` for anything missing or malformed.
 //
-// EVERY ONE OF THOSE IS CHECKED HERE, at parse, because a schema is
-// read once and used for millions of records, and because the person
-// who can fix a bad default is the person reading the schema.
+// All of them are checked here, because a schema is read once and used
+// for many records.
 //
 // ```novo
 // use avroschema
@@ -202,14 +236,13 @@ pub struct AvroSchema
 //         Ok(s)  => println(avroschema.type_name(s.kind))
 //         Err(e) => println(e.message())
 // ```
-pub fn parse(json: Str) -> Result<AvroSchema, AvroFault> []
-    todo("avro-nv.avroschema.parse")
+pub fn parse(text: Str) -> Result<AvroSchema, AvroFault> []
+    parse_in(text, "")
 
 // Parse a schema in the namespace of an enclosing named type.
 //
-// The form `parse` is written in terms of, and the one a caller needs
-// when it is assembling a schema out of pieces that were written to be
-// nested.  `""` is the null namespace.
+// `""` is the null namespace.  It is the form a caller needs when it
+// assembles a schema out of pieces written to be nested.
 //
 // ```novo
 // use avroschema
@@ -219,8 +252,340 @@ pub fn parse(json: Str) -> Result<AvroSchema, AvroFault> []
 //         Ok(s)  => println(avroschema.type_name(s.kind))
 //         Err(e) => println(e.message())
 // ```
-pub fn parse_in(json: Str, namespace: Str) -> Result<AvroSchema, AvroFault> []
-    todo("avro-nv.avroschema.parse_in")
+pub fn parse_in(text: Str, namespace: Str) -> Result<AvroSchema, AvroFault> []
+    match json.parse(text)
+        None    => Err(bad(AvroSchemaNotJson("the text does not parse as JSON"), ""))
+        Some(v) =>
+            var names = Names { full: [], defs: [] }
+            parse_value(v, namespace, names, "")
+
+// The primitive type a name denotes, or `None`.
+fn primitive_named(name: Str) -> ?AvroType
+    match name
+        "null"    => Some(AvroNull)
+        "boolean" => Some(AvroBoolean)
+        "int"     => Some(AvroInt)
+        "long"    => Some(AvroLong)
+        "float"   => Some(AvroFloat)
+        "double"  => Some(AvroDouble)
+        "bytes"   => Some(AvroBytes)
+        "string"  => Some(AvroString)
+        _         => None
+
+// One schema, from any of the three JSON forms.
+fn parse_value(v: JsonValueH, ns: Str, var names: Names, path: Str) -> Result<AvroSchema, AvroFault>
+    match json.type_of(v)
+        "string" => named_or_primitive(json.to_str(v) ?? "", ns, names, path)
+        "array"  => parse_union(json.to_list(v) ?? [], ns, names, path)
+        "object" => parse_object(v, ns, names, path)
+        other    => Err(bad(AvroBadSchemaShape("a schema is a string, an object or an array, not a ${other}"),
+                            path))
+
+// A type name: a primitive, or a named type defined earlier.
+fn named_or_primitive(name: Str, ns: Str, var names: Names,
+                      path: Str) -> Result<AvroSchema, AvroFault>
+    if let Some(t) = primitive_named(name)
+        return Ok(bare(t))
+    var i = index_of(names.full, full_name_in(name, "", ns))
+    if i < 0
+        i = index_of(names.full, name)
+    if i < 0
+        return Err(bad(AvroUnknownType(name), path))
+    Ok(names.defs[i])
+
+// The index of a string in a list, or -1.
+fn index_of(xs: [Str], x: Str) -> Int
+    for i in 0..list.len(xs)
+        if xs[i] == x
+            return i
+    -1
+
+// A union: every branch, with no union inside it and no type twice.
+fn parse_union(items: [JsonValueH], ns: Str, var names: Names,
+               path: Str) -> Result<AvroSchema, AvroFault>
+    var branches: [AvroSchema] = []
+    var keys: [Str] = []
+    for item in items
+        match parse_value(item, ns, names, path)
+            Err(e) =>
+                return Err(e)
+            Ok(b)  =>
+                if is_union(b.kind)
+                    return Err(bad(AvroBadSchemaShape("a union may not contain a union"), path))
+                let key = branch_key(b)
+                if index_of(keys, key) >= 0
+                    return Err(bad(AvroBadSchemaShape("the union has `${key}` twice"), path))
+                list.push(keys, key)
+                list.push(branches, b)
+    Ok(built(AvroUnion, "", [], "", [], [], "", [], branches, 0))
+
+// The name a union branch is known by: a named type's full name, and
+// the type name for the rest.
+fn branch_key(b: AvroSchema) -> Str
+    if is_named(b.kind)
+        return b.full_name
+    type_name(b.kind)
+
+// Whether a type is a union.
+fn is_union(t: AvroType) -> Bool
+    match t
+        AvroUnion => true
+        _         => false
+
+// The string attribute of an object, or `""`.
+fn text_of(v: JsonValueH, key: Str) -> Str
+    json.get_str(v, key) ?? ""
+
+// A schema written as a JSON object.
+fn parse_object(v: JsonValueH, ns: Str, var names: Names,
+                path: Str) -> Result<AvroSchema, AvroFault>
+    let Some(t) = json.get(v, "type") else
+        return Err(bad(AvroBadSchemaShape("a schema object needs a `type`"), path))
+    if json.type_of(t) != "string"
+        return parse_value(t, ns, names, path)
+    let name = json.to_str(t) ?? ""
+    let base = match name
+        "record" => parse_record(v, ns, names, path)
+        "error"  => parse_record(v, ns, names, path)
+        "enum"   => parse_enum(v, ns, names, path)
+        "fixed"  => parse_fixed(v, ns, names, path)
+        "array"  => parse_element(v, AvroArray, "items", ns, names, path)
+        "map"    => parse_element(v, AvroMap, "values", ns, names, path)
+        _        => named_or_primitive(name, ns, names, path)
+    match base
+        Err(e) => Err(e)
+        Ok(s)  => Ok(with_logical(s, v))
+
+// The logical-type attributes of an object, laid over a schema.
+fn with_logical(s: AvroSchema, v: JsonValueH) -> AvroSchema
+    let logical = text_of(v, "logicalType")
+    if logical == "" or s.is_reference
+        return s
+    AvroSchema { kind: s.kind, full_name: s.full_name, aliases: s.aliases, doc: s.doc,
+                 fields: s.fields, symbols: s.symbols, enum_default: s.enum_default,
+                 element: s.element, branches: s.branches, fixed_size: s.fixed_size,
+                 logical: logical, precision: json.get_int(v, "precision") ?? 0,
+                 scale: json.get_int(v, "scale") ?? 0, is_reference: false }
+
+// An array or a map: the one schema under `key`.
+fn parse_element(v: JsonValueH, kind: AvroType, key: Str, ns: Str, var names: Names,
+                 path: Str) -> Result<AvroSchema, AvroFault>
+    let Some(e) = json.get(v, key) else
+        return Err(bad(AvroBadSchemaShape("${type_name(kind)} needs `${key}`"), path))
+    match parse_value(e, ns, names, path + "[]")
+        Err(err) => Err(err)
+        Ok(item) => Ok(built(kind, "", [], "", [], [], "", [item], [], 0))
+
+// The name of a named type, checked, and registered while its body is
+// parsed.  Answers the index it was registered at.
+fn declare(v: JsonValueH, kind: AvroType, ns: Str, var names: Names,
+           path: Str) -> Result<Int, AvroFault>
+    let name = text_of(v, "name")
+    if name == ""
+        return Err(bad(AvroBadSchemaShape("${type_name(kind)} needs a `name`"), path))
+    let namespace = text_of(v, "namespace")
+    if not is_legal_name(name)
+        return Err(bad(AvroBadName(name), path))
+    if namespace != "" and not is_legal_name(namespace)
+        return Err(bad(AvroBadName(namespace), path))
+    var full = full_name_in(name, namespace, ns)
+    if json.get(v, "namespace") != None and namespace == "" and not str.contains(name, ".")
+        full = name
+    if primitive_named(last_part(full)) != None
+        return Err(bad(AvroBadName(full), path))
+    if index_of(names.full, full) >= 0
+        return Err(bad(AvroDuplicateName(full), path))
+    list.push(names.full, full)
+    list.push(names.defs, reference_to(kind, full))
+    Ok(list.len(names.full) - 1)
+
+// The part of a full name after its last dot.
+fn last_part(full: Str) -> Str
+    let n = str.len(full)
+    var i = n
+    while i > 0 and str.byte_at_or(full, i - 1, 0) != '.'
+        i -= 1
+    str.slice(full, i, n)
+
+// A named type's shared attributes: its full name, aliases and doc.
+fn named_base(v: JsonValueH, kind: AvroType, full: Str, path: Str) -> Result<AvroSchema, AvroFault>
+    let ns = namespace_of(full)
+    var aliases: [Str] = []
+    let listed = json.get_list(v, "aliases") ?? []
+    for a in listed
+        let other = json.to_str(a) ?? ""
+        if not is_legal_name(other)
+            return Err(bad(AvroBadName(other), path))
+        list.push(aliases, full_name_in(other, "", ns))
+    Ok(built(kind, full, aliases, text_of(v, "doc"), [], [], "", [], [], 0))
+
+// Record the finished definition of a named type.
+fn define(var names: Names, i: Int, s: AvroSchema)
+    names.defs[i] = s
+
+// A record: its name, then its fields in order.
+fn parse_record(v: JsonValueH, ns: Str, var names: Names,
+                path: Str) -> Result<AvroSchema, AvroFault>
+    let i = declare(v, AvroRecord, ns, names, path)!
+    let full = names.full[i]
+    let base = named_base(v, AvroRecord, full, full)!
+    let Some(items) = json.get_list(v, "fields") else
+        return Err(bad(AvroBadSchemaShape("record `${full}` needs `fields`"), full))
+    var fields: [AvroField] = []
+    var seen: [Str] = []
+    for item in items
+        let f = parse_field(item, namespace_of(full), names, full)!
+        if index_of(seen, f.name) >= 0
+            return Err(bad(AvroBadSchemaShape("field `${f.name}` appears twice"), full))
+        list.push(seen, f.name)
+        list.push(fields, f)
+    let s = built(AvroRecord, full, base.aliases, base.doc, fields, [], "", [], [], 0)
+    define(names, i, s)
+    Ok(s)
+
+// One field of a record.
+fn parse_field(v: JsonValueH, ns: Str, var names: Names, path: Str) -> Result<AvroField, AvroFault>
+    let name = text_of(v, "name")
+    if name == ""
+        return Err(bad(AvroBadSchemaShape("a field needs a `name`"), path))
+    if not is_legal_name(name) or str.contains(name, ".")
+        return Err(bad(AvroBadName(name), path))
+    let at = path + "." + name
+    let Some(t) = json.get(v, "type") else
+        return Err(bad(AvroBadSchemaShape("field `${name}` needs a `type`"), at))
+    let schema = parse_value(t, ns, names, at)!
+    let order = json.get_str(v, "order") ?? "ascending"
+    if order != "ascending" and order != "descending" and order != "ignore"
+        return Err(bad(AvroBadSchemaShape("`${order}` is not an order"), at))
+    var aliases: [Str] = []
+    let listed = json.get_list(v, "aliases") ?? []
+    for a in listed
+        list.push(aliases, json.to_str(a) ?? "")
+    var f = AvroField { name: name, schema: schema, default_json: "", has_default: false,
+                        aliases: aliases, order: order }
+    if let Some(d) = json.get(v, "default")
+        if not default_fits(d, schema)
+            return Err(bad(AvroBadDefault(name), at))
+        f = with_default_text(f, json.stringify(d))
+    Ok(f)
+
+// An enum: its name, its symbols and its default symbol.
+fn parse_enum(v: JsonValueH, ns: Str, var names: Names, path: Str) -> Result<AvroSchema, AvroFault>
+    let i = declare(v, AvroEnum, ns, names, path)!
+    let full = names.full[i]
+    let base = named_base(v, AvroEnum, full, full)!
+    let Some(items) = json.get_list(v, "symbols") else
+        return Err(bad(AvroBadSchemaShape("enum `${full}` needs `symbols`"), full))
+    var symbols: [Str] = []
+    for item in items
+        let sym = json.to_str(item) ?? ""
+        if not is_legal_name(sym) or str.contains(sym, ".")
+            return Err(bad(AvroBadName(sym), full))
+        if index_of(symbols, sym) >= 0
+            return Err(bad(AvroBadSchemaShape("symbol `${sym}` appears twice"), full))
+        list.push(symbols, sym)
+    let default = text_of(v, "default")
+    if default != "" and index_of(symbols, default) < 0
+        return Err(bad(AvroBadSchemaShape("the default `${default}` is not a symbol"), full))
+    let s = built(AvroEnum, full, base.aliases, base.doc, [], symbols, default, [], [], 0)
+    define(names, i, s)
+    Ok(s)
+
+// A fixed: its name and its size.
+fn parse_fixed(v: JsonValueH, ns: Str, var names: Names, path: Str) -> Result<AvroSchema, AvroFault>
+    let i = declare(v, AvroFixed, ns, names, path)!
+    let full = names.full[i]
+    let base = named_base(v, AvroFixed, full, full)!
+    let size = json.get_int(v, "size") ?? -1
+    if size < 0
+        return Err(bad(AvroBadSchemaShape("fixed `${full}` needs a `size` of 0 or more"), full))
+    let s = with_logical(built(AvroFixed, full, base.aliases, base.doc, [], [], "", [], [], size), v)
+    define(names, i, s)
+    Ok(s)
+
+// Whether a JSON number is written as an integer.
+fn is_integer(v: JsonValueH) -> Bool
+    let text = json.stringify(v)
+    json.type_of(v) == "number" and not str.contains(text, ".") and not str.contains(text, "e")
+        and not str.contains(text, "E")
+
+// Whether a field default's JSON fits a schema, by the rules of the
+// specification's section on record fields.  A union's default is a
+// value of its first branch; `bytes` and `fixed` defaults are strings
+// whose characters are the byte values.
+fn default_fits(d: JsonValueH, s: AvroSchema) -> Bool
+    let t = json.type_of(d)
+    match s.kind
+        AvroNull    => t == "null"
+        AvroBoolean => t == "boolean"
+        AvroInt     =>
+            let n = json.to_int(d) ?? 0
+            is_integer(d) and n >= -2147483648 and n <= 2147483647
+        AvroLong    => is_integer(d)
+        AvroFloat   => t == "number"
+        AvroDouble  => t == "number"
+        AvroString  => t == "string"
+        AvroBytes   => t == "string" and latin1_bytes(json.to_str(d) ?? "") != None
+        AvroFixed   =>
+            match latin1_bytes(json.to_str(d) ?? "")
+                None     => false
+                Some(bs) => t == "string" and list.len(bs) == s.fixed_size
+        AvroEnum    => t == "string" and index_of(s.symbols, json.to_str(d) ?? "") >= 0
+        AvroArray   =>
+            if t != "array"
+                return false
+            let items = json.to_list(d) ?? []
+            for e in items
+                if not default_fits(e, s.element[0])
+                    return false
+            true
+        AvroMap     =>
+            if t != "object"
+                return false
+            for k in json.keys(d)
+                if not default_fits(json.get(d, k) ?? d, s.element[0])
+                    return false
+            true
+        AvroUnion   => list.len(s.branches) > 0 and default_fits(d, s.branches[0])
+        AvroRecord  => record_fits(d, s)
+
+// Whether a JSON object fits a record: every field is present and
+// fits, or is absent and has a default of its own.  A reference is a
+// use of a record inside its own definition, which is still being
+// parsed and has no fields yet, so any object fits it.
+fn record_fits(d: JsonValueH, s: AvroSchema) -> Bool
+    if json.type_of(d) != "object"
+        return false
+    for f in s.fields
+        match json.get(d, f.name)
+            None    =>
+                if not f.has_default
+                    return false
+            Some(x) =>
+                if not default_fits(x, f.schema)
+                    return false
+    true
+
+// The byte values of a string whose every character is U+0000 to
+// U+00FF, which is how a `bytes` or `fixed` value is written in JSON,
+// or `None` when a character is above U+00FF.
+fn latin1_bytes(s: Str) -> ?[Int]
+    var out: [Int] = []
+    // The first byte of a two-byte character, while its second is
+    // awaited, or 0.  A `Str` is UTF-8, so a second byte follows.
+    var lead = 0
+    for i in 0..str.len(s)
+        let b = str.byte_at_or(s, i, 0)
+        if lead != 0
+            list.push(out, ((lead & 0x1F) << 6) | (b & 0x3F))
+            lead = 0
+        else if b < 0x80
+            list.push(out, b)
+        else if b == 0xC2 or b == 0xC3
+            lead = b
+        else
+            return None
+    Some(out)
 
 // The schema for one of the eight primitive types.
 //
@@ -231,7 +596,7 @@ pub fn parse_in(json: Str, namespace: Str) -> Result<AvroSchema, AvroFault> []
 //     println(avroschema.type_name(avroschema.primitive(AvroDouble).kind))
 // ```
 pub fn primitive(t: AvroType) -> AvroSchema []
-    todo("avro-nv.avroschema.primitive")
+    bare(t)
 
 // The specification's name for a type: `"null"`, `"record"`, `"map"`.
 //
@@ -242,7 +607,21 @@ pub fn primitive(t: AvroType) -> AvroSchema []
 //     println(avroschema.type_name(AvroFixed))
 // ```
 pub fn type_name(t: AvroType) -> Str []
-    todo("avro-nv.avroschema.type_name")
+    match t
+        AvroNull    => "null"
+        AvroBoolean => "boolean"
+        AvroInt     => "int"
+        AvroLong    => "long"
+        AvroFloat   => "float"
+        AvroDouble  => "double"
+        AvroBytes   => "bytes"
+        AvroString  => "string"
+        AvroRecord  => "record"
+        AvroEnum    => "enum"
+        AvroArray   => "array"
+        AvroMap     => "map"
+        AvroUnion   => "union"
+        AvroFixed   => "fixed"
 
 // Whether a type is one of the eight primitives.
 //
@@ -253,13 +632,11 @@ pub fn type_name(t: AvroType) -> Str []
 //     println("${avroschema.is_primitive(AvroBytes)}")
 // ```
 pub fn is_primitive(t: AvroType) -> Bool []
-    todo("avro-nv.avroschema.is_primitive")
+    primitive_named(type_name(t)) != None
 
-// Whether a type is named — record, enum or fixed.
+// Whether a type is named: record, enum or fixed.
 //
-// The predicate the naming rules and the resolution rules are written
-// in: a named type is matched by NAME and an unnamed one is matched by
-// structure.
+// A named type is matched by name and an unnamed one by structure.
 //
 // ```novo
 // use avroschema
@@ -268,18 +645,19 @@ pub fn is_primitive(t: AvroType) -> Bool []
 //     println("${avroschema.is_named(AvroRecord)}")
 // ```
 pub fn is_named(t: AvroType) -> Bool []
-    todo("avro-nv.avroschema.is_named")
+    match t
+        AvroRecord => true
+        AvroEnum   => true
+        AvroFixed  => true
+        _          => false
 
 // The full name a `name` and a `namespace` produce inside an enclosing
 // namespace.
 //
-// THE RULE EVERYBODY GETS WRONG, written once.  A `name` containing a
-// dot is already a full name and `namespace` is IGNORED.  Otherwise
-// `namespace` applies if it is not empty.  Otherwise `enclosing`
-// applies — and "enclosing" means the nearest enclosing NAMED type,
-// not the nearest enclosing schema, so a record inside an array inside
-// a record inherits the record's namespace and not the array's
-// nothing.
+// A `name` containing a dot is already a full name, and `namespace` is
+// ignored.  Otherwise `namespace` applies if it is not empty.
+// Otherwise `enclosing` applies: the namespace of the nearest
+// enclosing named type.
 //
 // ```novo
 // use avroschema
@@ -288,13 +666,19 @@ pub fn is_named(t: AvroType) -> Bool []
 //     println(avroschema.full_name_in("User", "", "com.example"))
 // ```
 pub fn full_name_in(name: Str, namespace: Str, enclosing: Str) -> Str []
-    todo("avro-nv.avroschema.full_name_in")
+    if str.contains(name, ".")
+        return name
+    if namespace != ""
+        return namespace + "." + name
+    if enclosing != ""
+        return enclosing + "." + name
+    name
 
 // Whether a string is a legal Avro name.
 //
-// It must start with a letter or an underscore and continue with
-// letters, digits and underscores.  A full name is those, separated by
-// dots.
+// A name starts with a letter or an underscore and continues with
+// letters, digits and underscores.  A full name is such names
+// separated by dots.
 //
 // ```novo
 // use avroschema
@@ -304,7 +688,22 @@ pub fn full_name_in(name: Str, namespace: Str, enclosing: Str) -> Str []
 //     println("${legal}")
 // ```
 pub fn is_legal_name(name: Str) -> Bool []
-    todo("avro-nv.avroschema.is_legal_name")
+    let n = str.len(name)
+    var start = true
+    for i in 0..n
+        let b = str.byte_at_or(name, i, 0)
+        let letter = b >= 'a' and b <= 'z' or b >= 'A' and b <= 'Z' or b == '_'
+        if b == '.'
+            if start or i == n - 1
+                return false
+            start = true
+        else if start
+            if not letter
+                return false
+            start = false
+        else if not letter and not (b >= '0' and b <= '9')
+            return false
+    n > 0
 
 // The namespace part of a full name, or `""`.
 //
@@ -315,7 +714,10 @@ pub fn is_legal_name(name: Str) -> Bool []
 //     println(avroschema.namespace_of("com.example.User"))
 // ```
 pub fn namespace_of(full_name: Str) -> Str []
-    todo("avro-nv.avroschema.namespace_of")
+    let n = str.len(full_name) - str.len(last_part(full_name))
+    if n == 0
+        return ""
+    str.slice(full_name, 0, n - 1)
 
 // The field of a record with a given name, or `None`.
 //
@@ -331,7 +733,10 @@ pub fn namespace_of(full_name: Str) -> Str []
 //         Err(e) => println(e.message())
 // ```
 pub fn field_named(s: AvroSchema, name: Str) -> ?AvroField []
-    todo("avro-nv.avroschema.field_named")
+    for f in s.fields
+        if f.name == name
+            return Some(f)
+    None
 
 // A field from a name and a schema, with no default and no aliases.
 //
@@ -346,13 +751,14 @@ pub fn field_named(s: AvroSchema, name: Str) -> ?AvroField []
 //         Err(e) => println(e.message())
 // ```
 pub fn field(name: Str, schema: AvroSchema) -> AvroField []
-    todo("avro-nv.avroschema.field")
+    AvroField { name: name, schema: schema, default_json: "", has_default: false, aliases: [],
+                order: "ascending" }
 
 // The same field with a default, as JSON text.
 //
-// `AvroBadDefault` when the JSON does not fit the field's type — an
-// object for an `int`, a string for a `boolean`, a number outside what
-// the type can hold.
+// `AvroBadDefault` when the text is not JSON or does not fit the
+// field's type: an object for an `int`, a string for a `boolean`, a
+// number outside what the type can hold.
 //
 // ```novo
 // use avroschema
@@ -365,8 +771,11 @@ pub fn field(name: Str, schema: AvroSchema) -> AvroField []
 //                 Err(e) => println(e.message())
 //         Err(e) => println(e.message())
 // ```
-pub fn with_default(f: AvroField, json: Str) -> Result<AvroField, AvroFault> []
-    todo("avro-nv.avroschema.with_default")
+pub fn with_default(f: AvroField, text: Str) -> Result<AvroField, AvroFault> []
+    if let Some(d) = json.parse(text)
+        if default_fits(d, f.schema)
+            return Ok(with_default_text(f, json.stringify(d)))
+    Err(bad(AvroBadDefault(f.name), f.name))
 
 // The index of a symbol in an enum, or `-1`.
 //
@@ -384,13 +793,13 @@ pub fn with_default(f: AvroField, json: Str) -> Result<AvroField, AvroFault> []
 //         Err(e) => println(e.message())
 // ```
 pub fn symbol_index(s: AvroSchema, symbol: Str) -> Int []
-    todo("avro-nv.avroschema.symbol_index")
+    index_of(s.symbols, symbol)
 
-// The branch of a union that a full type name selects, or `-1`.
+// The branch of a union that a type name selects, or `-1`.
 //
-// A union is matched by the branch's type name — `"null"`, `"string"`,
-// or a named type's full name — which is also how a JSON-encoded Avro
-// value names its branch.
+// A branch is matched by its type name, `"null"` or `"string"`, or by
+// a named type's full name.  That is also how Avro's JSON encoding
+// names the branch of a union value.
 //
 // ```novo
 // use avroschema
@@ -403,13 +812,15 @@ pub fn symbol_index(s: AvroSchema, symbol: Str) -> Int []
 //         Err(e) => println(e.message())
 // ```
 pub fn branch_index(s: AvroSchema, type_name: Str) -> Int []
-    todo("avro-nv.avroschema.branch_index")
+    for i in 0..list.len(s.branches)
+        if branch_key(s.branches[i]) == type_name
+            return i
+    -1
 
-// Whether a union has a `null` branch, and where.
+// The index of a union's `null` branch, or `-1`.
 //
-// Answers the index or `-1`.  The question every optional field is,
-// and the one a caller mapping Avro onto a language with nullable
-// types asks first.
+// An optional field is a union with a `null` branch, and this is the
+// question a caller mapping Avro onto nullable types asks first.
 //
 // ```novo
 // use avroschema
@@ -420,12 +831,25 @@ pub fn branch_index(s: AvroSchema, type_name: Str) -> Int []
 //         Err(e) => println(e.message())
 // ```
 pub fn null_branch(s: AvroSchema) -> Int []
-    todo("avro-nv.avroschema.null_branch")
+    branch_index(s, "null")
+
+// A string as a JSON string literal.
+fn quote(s: Str) -> Str
+    json.stringify(json.string(s))
+
+// A list of strings as a JSON array of string literals.
+fn quote_all(xs: [Str]) -> Str
+    var parts: [Str] = []
+    for x in xs
+        list.push(parts, quote(x))
+    "[" + str.join(parts, ",") + "]"
 
 // The schema as JSON, in the form it would be written to a file.
 //
-// Keeps the docs, the aliases and the defaults.  `canonical_form` is
-// the one that strips them.
+// It keeps the docs, the aliases, the defaults and the logical types,
+// and writes every name as its full name.  A named type is written in
+// full the first time and by name after that.  `canonical_form` is
+// the form that strips what does not change the reading.
 //
 // ```novo
 // use avroschema
@@ -436,20 +860,73 @@ pub fn null_branch(s: AvroSchema) -> Int []
 //         Err(e) => println(e.message())
 // ```
 pub fn to_json(s: AvroSchema) -> Str []
-    todo("avro-nv.avroschema.to_json")
+    var seen: [Str] = []
+    json_of(s, seen)
+
+// `to_json`, with the named types already written.
+fn json_of(s: AvroSchema, var seen: [Str]) -> Str
+    if is_named(s.kind)
+        if s.is_reference or index_of(seen, s.full_name) >= 0
+            return quote(s.full_name)
+        list.push(seen, s.full_name)
+    var parts = ["\"type\":${quote(type_name(s.kind))}"]
+    if is_named(s.kind)
+        list.push(parts, "\"name\":${quote(s.full_name)}")
+        if s.doc != ""
+            list.push(parts, "\"doc\":${quote(s.doc)}")
+        if list.len(s.aliases) > 0
+            list.push(parts, "\"aliases\":${quote_all(s.aliases)}")
+    match s.kind
+        AvroRecord =>
+            var fields: [Str] = []
+            for f in s.fields
+                list.push(fields, field_json(f, seen))
+            list.push(parts, "\"fields\":[${str.join(fields, ",")}]")
+        AvroEnum   =>
+            list.push(parts, "\"symbols\":${quote_all(s.symbols)}")
+            if s.enum_default != ""
+                list.push(parts, "\"default\":${quote(s.enum_default)}")
+        AvroFixed  => list.push(parts, "\"size\":${s.fixed_size}")
+        AvroArray  => list.push(parts, "\"items\":${json_of(s.element[0], seen)}")
+        AvroMap    => list.push(parts, "\"values\":${json_of(s.element[0], seen)}")
+        AvroUnion  =>
+            var branches: [Str] = []
+            for b in s.branches
+                list.push(branches, json_of(b, seen))
+            return "[" + str.join(branches, ",") + "]"
+        _          =>
+            if s.logical == ""
+                return quote(type_name(s.kind))
+    if s.logical != ""
+        list.push(parts, "\"logicalType\":${quote(s.logical)}")
+        if s.logical == "decimal"
+            list.push(parts, "\"precision\":${s.precision}")
+            list.push(parts, "\"scale\":${s.scale}")
+    "{" + str.join(parts, ",") + "}"
+
+// One field, as `to_json` writes it.
+fn field_json(f: AvroField, var seen: [Str]) -> Str
+    var parts = ["\"name\":${quote(f.name)}", "\"type\":${json_of(f.schema, seen)}"]
+    if f.has_default
+        list.push(parts, "\"default\":${f.default_json}")
+    if list.len(f.aliases) > 0
+        list.push(parts, "\"aliases\":${quote_all(f.aliases)}")
+    if f.order != "ascending"
+        list.push(parts, "\"order\":${quote(f.order)}")
+    "{" + str.join(parts, ",") + "}"
 
 // The Parsing Canonical Form of a schema.
 //
-// Strips everything that does not change how data is read — `doc`,
-// `aliases`, `default`, `order`, and every attribute the
-// specification does not name — resolves every name to its full name,
-// and puts the remaining attributes in the specification's order, with
-// no whitespace.
+// It is the specification's section "Parsing Canonical Form for
+// Schemas".  A primitive is written as its bare name.  A named type is
+// written with `name`, `type` and then `fields`, `symbols` or `size`,
+// its name as a full name, the first time it appears, and as its full
+// name after that.  `doc`, `aliases`, `default`, `order`, `namespace`
+// and the logical-type attributes are left out, and there is no
+// whitespace.
 //
-// THE BASIS OF EVERY FINGERPRINT.  Two schemas with the same canonical
-// form read the same bytes the same way, which is what makes a
-// fingerprint a usable schema identifier and what makes single-object
-// encoding work.
+// Two schemas with the same canonical form read the same bytes the same
+// way, which is what makes a fingerprint of it a schema identifier.
 //
 // ```novo
 // use avroschema
@@ -460,13 +937,35 @@ pub fn to_json(s: AvroSchema) -> Str []
 //         Err(e) => println(e.message())
 // ```
 pub fn canonical_form(s: AvroSchema) -> Str []
-    todo("avro-nv.avroschema.canonical_form")
+    var seen: [Str] = []
+    canonical_of(s, seen)
 
-// Every named type the schema defines, by full name, in definition
-// order.
-//
-// What a caller building a registry of schemas needs, and what
-// `avroresolve` walks to match a reader's names against a writer's.
+// `canonical_form`, with the named types already written.
+fn canonical_of(s: AvroSchema, var seen: [Str]) -> Str
+    if is_named(s.kind)
+        if s.is_reference or index_of(seen, s.full_name) >= 0
+            return quote(s.full_name)
+        list.push(seen, s.full_name)
+    let head = "\"name\":${quote(s.full_name)},\"type\":${quote(type_name(s.kind))}"
+    match s.kind
+        AvroRecord =>
+            var fields: [Str] = []
+            for f in s.fields
+                list.push(fields, "{\"name\":${quote(f.name)},\"type\":${canonical_of(f.schema, seen)}}")
+            "{${head},\"fields\":[${str.join(fields, ",")}]}"
+        AvroEnum   => "{${head},\"symbols\":${quote_all(s.symbols)}}"
+        AvroFixed  => "{${head},\"size\":${s.fixed_size}}"
+        AvroArray  => "{\"type\":\"array\",\"items\":${canonical_of(s.element[0], seen)}}"
+        AvroMap    => "{\"type\":\"map\",\"values\":${canonical_of(s.element[0], seen)}}"
+        AvroUnion  =>
+            var branches: [Str] = []
+            for b in s.branches
+                list.push(branches, canonical_of(b, seen))
+            "[" + str.join(branches, ",") + "]"
+        _          => quote(type_name(s.kind))
+
+// Every named type the schema defines, by full name, in the order the
+// definitions begin.
 //
 // ```novo
 // use avroschema
@@ -477,4 +976,41 @@ pub fn canonical_form(s: AvroSchema) -> Str []
 //         Err(e) => println(e.message())
 // ```
 pub fn named_types(s: AvroSchema) -> [Str] []
-    todo("avro-nv.avroschema.named_types")
+    var out: [Str] = []
+    for d in defs_of(s)
+        list.push(out, d.full_name)
+    out
+
+// Every named type a schema defines, as its definition, in the order
+// the definitions begin.  A reference is looked up among these.
+fn defs_of(s: AvroSchema) -> [AvroSchema]
+    var out: [AvroSchema] = []
+    var seen: [Str] = []
+    collect_defs(s, out, seen)
+    out
+
+// `defs_of`, one schema at a time.
+fn collect_defs(s: AvroSchema, var out: [AvroSchema], var seen: [Str])
+    if s.is_reference
+        return
+    if is_named(s.kind)
+        if index_of(seen, s.full_name) >= 0
+            return
+        list.push(seen, s.full_name)
+        list.push(out, s)
+    for f in s.fields
+        collect_defs(f.schema, out, seen)
+    for e in s.element
+        collect_defs(e, out, seen)
+    for b in s.branches
+        collect_defs(b, out, seen)
+
+// The definition a schema stands for: itself, or for a reference the
+// definition of the same full name among `defs`.
+fn deref(defs: [AvroSchema], s: AvroSchema) -> AvroSchema
+    if not s.is_reference
+        return s
+    for d in defs
+        if d.full_name == s.full_name
+            return d
+    s

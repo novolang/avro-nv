@@ -1,8 +1,5 @@
 // avroschema_tests.nv — the schema language, its naming rules, the
 // logical-type annotations and the canonical form.
-//
-// RED ON PURPOSE: every assertion reaches `not implemented:
-// avro-nv.<module>.<fn>`.
 
 use std.test
 use avroerror
@@ -76,7 +73,7 @@ fn test_the_full_name_rule_is_the_one_everybody_gets_wrong() [io]
     test.assert(avroschema.full_name_in("User", "com.example", "com.top")
                 == "com.example.User")
 
-    test.case("otherwise the ENCLOSING namespace applies")
+    test.case("otherwise the enclosing namespace applies")
     test.assert(avroschema.full_name_in("User", "", "com.top") == "com.top.User")
 
     test.case("and with neither, the name is its own full name")
@@ -196,7 +193,7 @@ fn test_an_unusable_logical_type_is_ignored_and_not_refused() [io]
             test.assert(not avrological.fits(AvroDate, s))
         Err(_) => test.fail("that is a string schema with a bad annotation")
 
-    test.case("and `check` is the separate call that TELLS you it was ignored")
+    test.case("and `check` is the separate call that says it was ignored")
     match avroschema.parse("{\"type\":\"string\",\"logicalType\":\"date\"}")
         Ok(s)  =>
             match avrological.check(s)
@@ -237,7 +234,7 @@ fn test_a_decimal_is_signed_and_a_duration_is_little_endian() [io]
         Ok(_)  => test.fail("zero digits is not a decimal")
         Err(f) => test.assert(avroerror.kind_name(f.kind) == "bad-parameter")
 
-    test.case("the unscaled integer is TWO'S COMPLEMENT, so negatives work")
+    test.case("the unscaled integer is two's complement, so negatives work")
     match avrological.decimal_bytes(-1234)
         Ok(b)  =>
             match avrological.decimal_unscaled(b)
@@ -245,7 +242,7 @@ fn test_a_decimal_is_signed_and_a_duration_is_little_endian() [io]
                 Err(_) => test.fail("it round-trips")
         Err(_) => test.fail("-1234 is an unscaled integer")
 
-    test.case("a duration is three UNSIGNED little-endian 32-bit counts")
+    test.case("a duration is three unsigned little-endian 32-bit counts")
     match avrological.duration_bytes(1, 2, 3)
         Ok(b)  =>
             match avrological.duration_of(b)

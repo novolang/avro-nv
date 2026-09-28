@@ -1,64 +1,56 @@
-// avroresolve.nv — schema resolution as a TYPED CHECK, made once,
-// before a single byte is decoded.
+// avroresolve.nv — schema resolution as a check made once, before a
+// byte is decoded.
 //
-// Every body is a `todo()`.  The signatures are the design, and the
-// compiler checks them as claims; see the README for the stamp.
+// Avro's binary encoding has no markers, so a decoder reading with a
+// schema that does not match the writer's does not fail: it reads the
+// next field's bytes as this field's and produces a plausible wrong
+// value.  Resolution therefore cannot happen as a decoder goes.  It is
+// a check over two schemas that either produces a plan or names the
+// rule that failed, and `AvroResolution` is the plan: per field,
+// whether to read it, skip it, fill it from a default or promote it,
+// and per symbol and branch how the writer's index maps to the
+// reader's.
 //
-// THIS MODULE IS WHY THE PACKAGE IS SHAPED THE WAY IT IS.  Avro's
-// binary encoding has no markers: no field tags, no lengths on a
-// record, no terminators.  A decoder reading with a schema that does
-// not match the writer's therefore does not fail — it reads the next
-// field's bytes as this field's, produces a plausible wrong value, and
-// carries on until it runs off the end of the block, if it ever does.
+// The rules are the specification's section "Schema Resolution".
 //
-// SO RESOLUTION CANNOT BE SOMETHING THE DECODER DOES AS IT GOES.  It
-// is a check over two schemas, performed once, that either produces a
-// PLAN or names the rule that failed.  `AvroResolution` is that plan:
-// a value that says, per field, whether to read it, skip it, or fill
-// it from a default, and per branch and per symbol how the writer's
-// index maps to the reader's.  Decoding then cannot go wrong, because
-// every decision was made before it started.
+//   same type          resolves.
+//   int                promotes to long, float and double.
+//   long               promotes to float and double.
+//   float              promotes to double.
+//   string, bytes      convert both ways; the encodings are identical.
+//   record             the writer's name must be the reader's name or
+//                      one of the reader's aliases.  A field in both
+//                      resolves recursively, matched by the reader
+//                      field's name or aliases.  A field only the
+//                      writer has is skipped.  A field only the reader
+//                      has is filled from its default, and without one
+//                      the resolution fails.
+//   enum               matched by name.  A writer's symbol the reader
+//                      lacks reads as the reader's default symbol, and
+//                      without one the resolution fails.
+//   array, map         resolve when their items do.
+//   fixed              matched by name and size.
+//   writer union       every branch must resolve against the reader.
+//   reader union       the writer's schema is read as the first
+//                      branch of the same type, or failing that the
+//                      first branch it resolves against.
 //
-// THE SPECIFICATION'S RULES, AND ALL OF THEM ARE HERE.
+// The specification reports a writer's union branch or enum symbol
+// the reader cannot take only when such a value is read.  This module
+// refuses the pair at resolution instead, so a plan never fails part
+// of the way through a file.
 //
-//   Same type            resolves.
-//   int → long,          resolves: a widening promotion, and only in
-//   float, double        that direction.
-//   long → float,        resolves.
-//   double
-//   float → double       resolves.
-//   string ↔ bytes       resolves, both ways: the encodings are
-//                        identical.
-//   records              resolve when their names match — the
-//                        reader's name against the writer's name or
-//                        any of the writer's ALIASES.  Then, per
-//                        field: a field in both resolves recursively;
-//                        a field only the writer has is SKIPPED; a
-//                        field only the reader has needs a DEFAULT or
-//                        the whole resolution fails.
-//   enums                resolve by name.  A symbol the writer wrote
-//                        that the reader does not have falls back to
-//                        the reader's `default` symbol, or fails.
-//   arrays, maps         resolve when their elements do.
-//   fixed                resolves by name AND size.
-//   writer is a union    the reader resolves against the branch the
-//                        writer actually wrote.
-//   reader is a union    the FIRST branch that resolves against the
-//                        writer's schema wins.
+// A reader's union picks its first matching branch, so the order of a
+// reader's union changes what it reads: a branch added to the front
+// is a breaking change, and one added to the back is not.
 //
-// THE ASYMMETRY IN THE LAST TWO IS THE ONE PEOPLE MISS.  A reader that
-// is a union picks its first matching branch, so the ORDER of a
-// reader's union changes what it reads — and adding a branch to the
-// front of a union is a breaking change even though adding one to the
-// back is not.
-//
-// A PLAN IS ALSO THE ANSWER TO "IS THIS CHANGE SAFE?"  A caller with
-// an old schema and a new one calls `resolve` and is told, at build
-// time or at review time, exactly which rule a proposed change breaks.
+// A plan also answers whether a schema change is safe.  `describe`
+// puts it in sentences for a schema review.
 
 use avroerror
 use avroschema
 use avrovalue
+use avrobinary
 
 // What a reader does with one of the writer's fields.
 //
@@ -71,21 +63,20 @@ use avrovalue
 pub enum AvroFieldAction
     // Read it into a reader's field.
     AvroReadField
-    // Decode past it and throw it away: the writer has it and the
-    // reader does not.  NOT an error — it is how a writer adds a
-    // field without breaking an old reader.
+    // Decode past it and discard it: the writer has it and the reader
+    // does not.  This is how a writer adds a field without breaking an
+    // old reader.
     AvroSkipField
     // Fill a reader's field from its default: the reader has it and
-    // the writer does not.  NOT an error either, when there is a
-    // default — it is how a reader adds a field without breaking on
-    // old data.
+    // the writer does not.  This is how a reader adds a field without
+    // breaking on old data.
     AvroDefaultField
-    // Read it and PROMOTE it: the writer wrote an `int` and the
-    // reader wants a `long`, or one of the other five promotions.
+    // Read it and promote it: the writer wrote an `int` and the reader
+    // wants a `long`, or one of the other promotions.
     AvroPromoteField
 
-// The specification's name for an action: `"read"`, `"skip"`,
-// `"default"`, `"promote"`.
+// The name of an action: `"read"`, `"skip"`, `"default"`,
+// `"promote"`.
 //
 // ```novo
 // use avroresolve
@@ -94,10 +85,14 @@ pub enum AvroFieldAction
 //     println(avroresolve.action_name(AvroReadField))
 // ```
 pub fn action_name(a: AvroFieldAction) -> Str []
-    todo("avro-nv.avroresolve.action_name")
+    match a
+        AvroReadField    => "read"
+        AvroSkipField    => "skip"
+        AvroDefaultField => "default"
+        AvroPromoteField => "promote"
 
 // One step of a plan: what to do with one of the writer's fields, or
-// one of the reader's that the writer lacks.
+// with one of the reader's that the writer lacks.
 //
 // ```novo
 // use avroresolve
@@ -124,12 +119,12 @@ pub struct AvroResolveStep
 //     println(avroresolve.action_name(avroresolve.step(AvroReadField, 0, 0).action))
 // ```
 pub fn step(action: AvroFieldAction, writer_index: Int, reader_index: Int) -> AvroResolveStep []
-    todo("avro-nv.avroresolve.step")
+    AvroResolveStep { action: action, writer_index: writer_index, reader_index: reader_index }
 
 // A plan for reading data written with one schema through another.
 //
-// The value a decoder takes instead of two schemas.  Built once, and
-// then a million records decode with no decisions left to make.
+// A decoder takes it instead of two schemas.  It is built once, and
+// then every record decodes with no decision left to make.
 //
 // ```novo
 // use avroresolve
@@ -149,39 +144,51 @@ pub struct AvroResolution
     // The reader's schema.
     reader: AvroSchema
     // The per-field plan, for a record pair: one step per writer field
-    // plus one per reader-only field with a default, in the order a
-    // decoder performs them.
+    // in the writer's order, then one per reader-only field.
     steps: [AvroResolveStep]
     // For an enum pair, the reader's symbol index for each of the
-    // writer's, or `-1` for one that falls back to the reader's
-    // `default`.
-    symbol_map: [Int]
-    // For a union pair, the reader's branch index for each of the
     // writer's.
+    symbol_map: [Int]
+    // For a writer's union, the reader's branch index for each of the
+    // writer's branches, or 0 when the reader is not a union.  For a
+    // reader's union and a writer that is not one, the one branch the
+    // writer's data is read as.
     branch_map: [Int]
-    // The values reader-only fields are filled with, already decoded
-    // from their defaults under the READER's schema, in the order
-    // their `AvroDefaultField` steps appear.
-    //
-    // Decoded HERE and not per record, because a default is a constant
-    // and decoding it a million times is a million times too many.
+    // The values reader-only fields are filled with, decoded from their
+    // defaults under the reader's schema, in the order of their
+    // `AvroDefaultField` steps.  They are decoded here once, not per
+    // record.
     defaults: [AvroValue]
-    // The nested plans, one per `AvroReadField` or `AvroPromoteField`
-    // step whose field is itself a record, enum, array, map, union or
-    // fixed.
+    // The nested plans: one per `AvroReadField` or `AvroPromoteField`
+    // step of a record, one per writer branch of a union, the one
+    // branch of a reader's union, or the items of an array or a map.
     nested: [AvroResolution]
+
+// The named types of both schemas, for looking up a reference.
+struct Env
+    wdefs: [AvroSchema]
+    rdefs: [AvroSchema]
+
+// A plan with only its two schemas, for a pair that needs no more.
+fn leaf(w: AvroSchema, r: AvroSchema) -> AvroResolution
+    AvroResolution { writer: w, reader: r, steps: [], symbol_map: [], branch_map: [], defaults: [],
+                     nested: [] }
+
+// A plan with nested plans and a branch map.
+fn nest(w: AvroSchema, r: AvroSchema, branch_map: [Int], nested: [AvroResolution]) -> AvroResolution
+    AvroResolution { writer: w, reader: r, steps: [], symbol_map: [], branch_map: branch_map,
+                     defaults: [], nested: nested }
+
+// A resolution fault.
+fn refused(detail: Str, path: Str) -> AvroFault
+    avroerror.fault(AvroNoResolution(detail), avroerror.at_path(path))
 
 // Resolve a reader's schema against a writer's.
 //
-// `AvroNoResolution` naming the rule that failed, in the
-// specification's own words, and `AvroMissingFieldNoDefault` naming
-// the field for the failure people actually hit.
-// `avroerror.is_schema_error` answers true for both: neither is about
-// anybody's bytes.
-//
-// THE CALL THIS PACKAGE EXISTS FOR.  Nothing else catches a schema
-// mismatch, because the binary encoding has nothing in it to catch one
-// with.
+// `AvroNoResolution` names the rule that failed, and
+// `AvroMissingFieldNoDefault` names the reader's field without a
+// default, which is the failure most schema changes meet.
+// `avroerror.is_schema_error` answers true for both.
 //
 // ```novo
 // use avroresolve
@@ -199,12 +206,152 @@ pub struct AvroResolution
 //         Err(e) => println(e.message())
 // ```
 pub fn resolve(writer: AvroSchema, reader: AvroSchema) -> Result<AvroResolution, AvroFault> []
-    todo("avro-nv.avroresolve.resolve")
+    let both = Env { wdefs: avroschema.defs_of(writer), rdefs: avroschema.defs_of(reader) }
+    plan(both, writer, reader, [], label(reader))
 
-// Whether the two schemas resolve at all, with no plan built.
-//
-// The cheap question, for a caller checking a hundred schema pairs in
-// a registry and only wanting to know which ones are broken.
+// The name a plan's top is reported by: the reader's full name, or its
+// type name.
+fn label(r: AvroSchema) -> Str
+    if r.full_name != ""
+        return r.full_name
+    avroschema.type_name(r.kind)
+
+// The plan for one pair.  `active` holds the named pairs being
+// resolved further up, which is where a recursive type meets itself.
+fn plan(both: Env, w0: AvroSchema, r0: AvroSchema, active: [Str],
+        path: Str) -> Result<AvroResolution, AvroFault>
+    let w = avroschema.deref(both.wdefs, w0)
+    let r = avroschema.deref(both.rdefs, r0)
+    let key = w.full_name + "|" + r.full_name
+    if avroschema.is_named(w.kind) and list.contains(active, key)
+        return Ok(leaf(avroschema.reference_to(w.kind, w.full_name),
+                       avroschema.reference_to(r.kind, r.full_name)))
+    let inner = list.concat(active, [key])
+    if is_kind(w.kind, AvroUnion)
+        var map: [Int] = []
+        var nested: [AvroResolution] = []
+        for b in w.branches
+            if is_kind(r.kind, AvroUnion)
+                let Some(pick) = pick_branch(both, b, r, inner, path) else
+                    return Err(refused("the writer's union branch ${branch_label(both.wdefs, b)} matches no branch of the reader's union",
+                                       path))
+                list.push(map, pick.index)
+                list.push(nested, pick.plan)
+            else
+                list.push(map, 0)
+                list.push(nested, plan(both, b, r, inner, path)!)
+        return Ok(nest(w, r, map, nested))
+    if is_kind(r.kind, AvroUnion)
+        let Some(pick) = pick_branch(both, w, r, inner, path) else
+            return Err(refused("the writer's ${branch_label(both.wdefs, w)} matches no branch of the reader's union",
+                               path))
+        return Ok(nest(w, r, [pick.index], [pick.plan]))
+    if avroschema.type_name(w.kind) != avroschema.type_name(r.kind)
+        if promotes(w.kind, r.kind)
+            return Ok(leaf(w, r))
+        return Err(refused("the writer's ${avroschema.type_name(w.kind)} cannot be read as the reader's ${avroschema.type_name(r.kind)}",
+                           path))
+    if avroschema.is_named(w.kind) and not names_match(w, r)
+        return Err(refused("the writer's `${w.full_name}` is not the reader's `${r.full_name}` or one of its aliases",
+                           path))
+    match w.kind
+        AvroRecord => plan_record(both, w, r, inner, path)
+        AvroEnum   => plan_enum(w, r, path)
+        AvroFixed  =>
+            if w.fixed_size != r.fixed_size
+                return Err(refused("the writer's fixed has ${w.fixed_size} bytes and the reader's ${r.fixed_size}",
+                                   path))
+            Ok(leaf(w, r))
+        AvroArray  => Ok(nest(w, r, [], [plan(both, w.element[0], r.element[0], inner, path + "[]")!]))
+        AvroMap    => Ok(nest(w, r, [], [plan(both, w.element[0], r.element[0], inner, path + "[]")!]))
+        _          => Ok(leaf(w, r))
+
+// Whether a type is a particular one.
+fn is_kind(a: AvroType, b: AvroType) -> Bool
+    avroschema.type_name(a) == avroschema.type_name(b)
+
+// How a union branch is named in a sentence.
+fn branch_label(defs: [AvroSchema], b: AvroSchema) -> Str
+    "`" + avroschema.branch_key(avroschema.deref(defs, b)) + "`"
+
+// A reader's branch chosen for a writer's schema, and the plan for it.
+struct Pick
+    index: Int
+    plan: AvroResolution
+
+// The reader's branch a writer's schema is read as: the first of the
+// same type, or failing that the first it resolves against.
+fn pick_branch(both: Env, w0: AvroSchema, r: AvroSchema, active: [Str], path: Str) -> ?Pick
+    let w = avroschema.deref(both.wdefs, w0)
+    for i in 0..list.len(r.branches)
+        let b = avroschema.deref(both.rdefs, r.branches[i])
+        if is_kind(w.kind, b.kind) and (not avroschema.is_named(w.kind) or names_match(w, b))
+            if let Ok(p) = plan(both, w0, r.branches[i], active, path)
+                return Some(Pick { index: i, plan: p })
+    for i in 0..list.len(r.branches)
+        if let Ok(p) = plan(both, w0, r.branches[i], active, path)
+            return Some(Pick { index: i, plan: p })
+    None
+
+// The reader field a writer's field is read into, or -1.
+fn reader_field(r: AvroSchema, name: Str) -> Int
+    for i in 0..list.len(r.fields)
+        if r.fields[i].name == name
+            return i
+    for i in 0..list.len(r.fields)
+        if list.contains(r.fields[i].aliases, name)
+            return i
+    -1
+
+// The plan for two records.
+fn plan_record(both: Env, w: AvroSchema, r: AvroSchema, active: [Str],
+               path: Str) -> Result<AvroResolution, AvroFault>
+    var steps: [AvroResolveStep] = []
+    var nested: [AvroResolution] = []
+    var defaults: [AvroValue] = []
+    var used: [Int] = []
+    for wi in 0..list.len(w.fields)
+        let wf = w.fields[wi]
+        let ri = reader_field(r, wf.name)
+        if ri < 0 or list.contains(used, ri)
+            list.push(steps, step(AvroSkipField, wi, -1))
+        else
+            let rf = r.fields[ri]
+            let p = plan(both, wf.schema, rf.schema, active, path + "." + rf.name)!
+            let wsch = avroschema.deref(both.wdefs, wf.schema)
+            let rsch = avroschema.deref(both.rdefs, rf.schema)
+            let promoted = avroschema.type_name(wsch.kind) != avroschema.type_name(rsch.kind)
+                and promotes(wsch.kind, rsch.kind)
+            list.push(steps, step((if promoted then AvroPromoteField else AvroReadField), wi, ri))
+            list.push(nested, p)
+            list.push(used, ri)
+    for ri in 0..list.len(r.fields)
+        if not list.contains(used, ri)
+            let rf = r.fields[ri]
+            if not rf.has_default
+                return Err(avroerror.fault(AvroMissingFieldNoDefault(rf.name),
+                                           avroerror.at_path(path + "." + rf.name)))
+            list.push(steps, step(AvroDefaultField, -1, ri))
+            list.push(defaults, avrovalue.from_default_json(rf.default_json, rf.schema)!)
+    Ok(AvroResolution { writer: w, reader: r, steps: steps, symbol_map: [], branch_map: [],
+                        defaults: defaults, nested: nested })
+
+// The plan for two enums.
+fn plan_enum(w: AvroSchema, r: AvroSchema, path: Str) -> Result<AvroResolution, AvroFault>
+    var map: [Int] = []
+    let fallback = avroschema.symbol_index(r, r.enum_default)
+    for sym in w.symbols
+        var i = avroschema.symbol_index(r, sym)
+        if i < 0
+            i = fallback
+        if i < 0
+            return Err(refused("the writer's symbol `${sym}` is not in the reader's enum, which has no default",
+                               path))
+        list.push(map, i)
+    Ok(AvroResolution { writer: w, reader: r, steps: [], symbol_map: map, branch_map: [], defaults: [],
+                        nested: [] })
+
+// Whether the two schemas resolve at all.
 //
 // ```novo
 // use avroresolve
@@ -216,13 +363,13 @@ pub fn resolve(writer: AvroSchema, reader: AvroSchema) -> Result<AvroResolution,
 //         Err(e) => println(e.message())
 // ```
 pub fn resolves(writer: AvroSchema, reader: AvroSchema) -> Bool []
-    todo("avro-nv.avroresolve.resolves")
+    match resolve(writer, reader)
+        Ok(_)  => true
+        Err(_) => false
 
-// Whether a plan is the identity: read every field, promote nothing,
-// skip nothing, default nothing.
-//
-// A decoder can take a faster path when it is, and a caller reviewing
-// a schema change wants to know when a change did nothing.
+// Whether a plan is the identity: every field read into the same
+// position, nothing skipped, defaulted or promoted, and every symbol
+// and branch at the same index.
 //
 // ```novo
 // use avroresolve
@@ -237,16 +384,40 @@ pub fn resolves(writer: AvroSchema, reader: AvroSchema) -> Bool []
 //         Err(e) => println(e.message())
 // ```
 pub fn is_identity(r: AvroResolution) -> Bool []
-    todo("avro-nv.avroresolve.is_identity")
+    let w = r.writer
+    let rd = r.reader
+    if w.is_reference or rd.is_reference
+        return true
+    if not is_kind(w.kind, rd.kind)
+        return false
+    for s in r.steps
+        if not is_kind_action(s.action, AvroReadField) or s.writer_index != s.reader_index
+            return false
+    for i in 0..list.len(r.symbol_map)
+        if r.symbol_map[i] != i
+            return false
+    if list.len(r.symbol_map) != list.len(rd.symbols)
+        return false
+    for i in 0..list.len(r.branch_map)
+        if r.branch_map[i] != i
+            return false
+    if list.len(r.branch_map) != list.len(rd.branches)
+        return false
+    for p in r.nested
+        if not is_identity(p)
+            return false
+    true
+
+// Whether an action is a particular one.
+fn is_kind_action(a: AvroFieldAction, b: AvroFieldAction) -> Bool
+    action_name(a) == action_name(b)
 
 // Whether one primitive type promotes to another.
 //
-// `int` to `long`, `float` or `double`; `long` to `float` or
-// `double`; `float` to `double`; `string` to `bytes` and back.  Six
-// promotions and two conversions, and NONE of them in the other
-// direction — a writer's `long` does not resolve against a reader's
-// `int`, because the value might not fit and Avro will not truncate
-// one silently.
+// `int` to `long`, `float` or `double`; `long` to `float` or `double`;
+// `float` to `double`; `string` to `bytes` and back.  None of them goes
+// the other way: a writer's `long` does not resolve against a reader's
+// `int`, because the value might not fit and Avro does not truncate.
 //
 // ```novo
 // use avroresolve
@@ -257,14 +428,18 @@ pub fn is_identity(r: AvroResolution) -> Bool []
 //     println("${avroresolve.promotes(AvroLong, AvroInt)}")
 // ```
 pub fn promotes(writer: AvroType, reader: AvroType) -> Bool []
-    todo("avro-nv.avroresolve.promotes")
+    let pair = avroschema.type_name(writer) + ">" + avroschema.type_name(reader)
+    list.contains(["int>long", "int>float", "int>double", "long>float", "long>double", "float>double",
+                   "string>bytes", "bytes>string"],
+                   pair)
 
-// Whether a reader's name matches a writer's, aliases included.
+// Whether a writer's name matches a reader's.
 //
-// The reader's full name against the writer's full name OR any of the
-// writer's aliases.  ONE DIRECTION ONLY: an alias on the reader does
-// nothing, because it is the writer's data that has to be recognised.
-// Getting that backwards is the reason a rename "did not work".
+// The writer's full name must be the reader's full name or one of the
+// reader's aliases.  Aliases work in that one direction (specification
+// section "Aliases"): a reader that renamed a type lists the old name
+// as an alias, and an alias on the writer's schema does nothing.  Two
+// unnamed schemas match when they are of the same type.
 //
 // ```novo
 // use avroresolve
@@ -276,21 +451,25 @@ pub fn promotes(writer: AvroType, reader: AvroType) -> Bool []
 //         Err(e) => println(e.message())
 // ```
 pub fn names_match(writer: AvroSchema, reader: AvroSchema) -> Bool []
-    todo("avro-nv.avroresolve.names_match")
+    if not is_kind(writer.kind, reader.kind)
+        return false
+    if not avroschema.is_named(writer.kind)
+        return true
+    writer.full_name == reader.full_name or list.contains(reader.aliases, writer.full_name)
 
 // Decode a datum written with the plan's writer schema into the plan's
 // reader schema.
 //
-// The decoder with every decision already made.  Skips the writer's
-// extra fields, fills the reader's missing ones from the defaults this
-// plan already decoded, maps enum and union indices, and promotes
-// where the plan says to.
+// It skips the writer's extra fields, fills the reader's missing ones
+// from the defaults the plan holds, maps enum and union indices, and
+// promotes where the plan says to.
 //
 // ```novo
 // use std.bytes
 // use avrobinary
 // use avroresolve
 // use avroschema
+// use avrovalue
 //
 // fn main() [io]
 //     match avroschema.parse("\"int\"")
@@ -306,17 +485,157 @@ pub fn names_match(writer: AvroSchema, reader: AvroSchema) -> Bool []
 // ```
 pub fn decode(src: Bytes, off: Int, r: AvroResolution,
               limits: AvroLimits) -> Result<AvroValue, AvroFault> []
-    todo("avro-nv.avroresolve.decode")
+    let d = decode_at(src, off, r, limits)
+    match d.fault
+        None    => Ok(d.value)
+        Some(f) => Err(f)
 
-// A sentence saying what a schema change did, for a reader deciding
+// `decode`, answering where the datum ended.
+fn decode_at(src: Bytes, off: Int, r: AvroResolution, limits: AvroLimits) -> Dec
+    let w = Walk { defs: avroschema.defs_of(r.writer), src: src, limits: limits, build: true }
+    run(w, r, [], off, 0, label(r.reader))
+
+// One datum through a plan.  `up` holds the plans further up, where a
+// recursive type's plan is found again.
+fn run(w: Walk, p0: AvroResolution, up: [AvroResolution], at: Int, depth: Int, path: Str) -> Dec
+    let p = again(p0, up)
+    if w.limits.max_depth >= 0 and depth > w.limits.max_depth
+        return avrobinary.stop(AvroLengthLimitReached(depth, w.limits.max_depth), path, at)
+    let stack = list.concat(up, [p])
+    let wsch = p.writer
+    let rsch = p.reader
+    if is_kind(wsch.kind, AvroUnion)
+        let r = avrobinary.read_long(w.src, avrobinary.cursor(at))
+        if not r.cursor.ok
+            return avrobinary.from_cursor(r.cursor, path)
+        if r.value < 0 or r.value >= list.len(wsch.branches)
+            return avrobinary.stop(AvroBadUnionIndex(r.value, list.len(wsch.branches)), path, at)
+        let d = run(w, p.nested[r.value], stack, r.cursor.at, depth + 1, path)
+        if d.fault != None or not is_kind(rsch.kind, AvroUnion)
+            return d
+        return avrobinary.got(AvroUnionValue(p.branch_map[r.value], [d.value]), d.at)
+    if is_kind(rsch.kind, AvroUnion)
+        let d = run(w, p.nested[0], stack, at, depth + 1, path)
+        if d.fault != None
+            return d
+        return avrobinary.got(AvroUnionValue(p.branch_map[0], [d.value]), d.at)
+    match rsch.kind
+        AvroRecord => run_record(w, p, stack, at, depth, path)
+        AvroEnum   =>
+            let d = avrobinary.walk(w, wsch, at, depth, path)
+            let AvroEnumValue(i) = d.value else
+                return d
+            avrobinary.got(AvroEnumValue(p.symbol_map[i]), d.at)
+        AvroArray  => run_blocks(w, p, stack, at, depth, path, false)
+        AvroMap    => run_blocks(w, p, stack, at, depth, path, true)
+        _          =>
+            let d = avrobinary.walk(w, wsch, at, depth, path)
+            if d.fault != None
+                return d
+            avrobinary.got(promote(d.value, rsch.kind), d.at)
+
+// A plan, or for the plan of a recursive use the nearest plan further
+// up for the same two names, which is the one it stands for.
+fn again(p: AvroResolution, up: [AvroResolution]) -> AvroResolution
+    if not p.writer.is_reference and not p.reader.is_reference
+        return p
+    var found = p
+    for q in up
+        if q.writer.full_name == p.writer.full_name and q.reader.full_name == p.reader.full_name
+            found = q
+    found
+
+// A value of the writer's type, as a value of the reader's.
+fn promote(v: AvroValue, to: AvroType) -> AvroValue
+    match (v, to)
+        (AvroIntValue(n), AvroLong)     => AvroLongValue(n)
+        (AvroIntValue(n), AvroFloat)    => AvroFloatValue(narrow(n as Float))
+        (AvroIntValue(n), AvroDouble)   => AvroDoubleValue(n as Float)
+        (AvroLongValue(n), AvroFloat)   => AvroFloatValue(narrow(n as Float))
+        (AvroLongValue(n), AvroDouble)  => AvroDoubleValue(n as Float)
+        (AvroFloatValue(x), AvroDouble) => AvroDoubleValue(x)
+        (AvroStrValue(s), AvroBytes)    => AvroBytesValue(bytes.from_str(s))
+        (AvroBytesValue(b), AvroString) => AvroStrValue(bytes.to_str(b))
+        _                               => v
+
+// A float rounded to the 32 bits a reader's `float` holds.
+fn narrow(x: Float) -> Float
+    let r: fp32 = x
+    let wide: Float = r
+    wide
+
+// A record through its plan's steps.
+fn run_record(w: Walk, p: AvroResolution, stack: [AvroResolution], at: Int, depth: Int,
+              path: Str) -> Dec
+    var fields: [AvroValue] = []
+    for _ in 0..list.len(p.reader.fields)
+        list.push(fields, AvroNullValue)
+    var i = at
+    var n = 0
+    var d = 0
+    for s in p.steps
+        match s.action
+            AvroSkipField    =>
+                let wf = p.writer.fields[s.writer_index]
+                let skipped = avrobinary.walk(Walk { defs: w.defs, src: w.src, limits: w.limits, build: false },
+                                              wf.schema, i, depth + 1, path + "." + wf.name)
+                if skipped.fault != None
+                    return skipped
+                i = skipped.at
+            AvroDefaultField =>
+                fields[s.reader_index] = p.defaults[d]
+                d += 1
+            _                =>
+                let rf = p.reader.fields[s.reader_index]
+                let got = run(w, p.nested[n], stack, i, depth + 1, path + "." + rf.name)
+                if got.fault != None
+                    return got
+                fields[s.reader_index] = got.value
+                n += 1
+                i = got.at
+    avrobinary.got(AvroRecordValue(fields), i)
+
+// The blocks of an array or a map, each item through the items' plan.
+fn run_blocks(w: Walk, p: AvroResolution, stack: [AvroResolution], at: Int, depth: Int, path: Str,
+              is_map: Bool) -> Dec
+    var keys: [Str] = []
+    var items: [AvroValue] = []
+    var i = at
+    loop
+        let h = avrobinary.read_block_header(w.src, avrobinary.cursor(i))
+        if not h.cursor.ok
+            return avrobinary.from_cursor(h.cursor, path)
+        i = h.cursor.at
+        if h.count == 0
+            break
+        if w.limits.max_items >= 0 and h.count > w.limits.max_items
+            return avrobinary.stop(AvroLengthLimitReached(h.count, w.limits.max_items), path, i)
+        for _ in 0..h.count
+            let here = "${path}[${list.len(items)}]"
+            if is_map
+                let key = avrobinary.walk_bytes(w, i, here, AvroString)
+                if key.fault != None
+                    return key
+                if let AvroStrValue(text) = key.value
+                    list.push(keys, text)
+                i = key.at
+            let d = run(w, p.nested[0], stack, i, depth + 1, here)
+            if d.fault != None
+                return d
+            list.push(items, d.value)
+            i = d.at
+    if is_map
+        return avrobinary.got(AvroMapValue(keys, items), i)
+    avrobinary.got(AvroArrayValue(items), i)
+
+// A sentence for each thing a schema change does, for a reader deciding
 // whether to make it.
 //
-// "Field `nickname` added with a default, so old data reads."
-// "Field `id` promoted from int to long."  "Branch added to the FRONT
-// of union `status`, which changes what an old reader reads."
-//
-// The plan is already the answer; this is the plan in words, because a
-// schema review is read by people and a list of steps is not.
+// "Field `nickname` is only in the reader's schema, and is filled from
+// its default."  "`User.id` is promoted from int to long."  "The
+// writer's branch 0 of the union at `User.status` is read as the
+// reader's branch 1."  A plan that changes nothing is "The reader
+// reads the writer's data unchanged."
 //
 // ```novo
 // use avroresolve
@@ -331,4 +650,60 @@ pub fn decode(src: Bytes, off: Int, r: AvroResolution,
 //         Err(e) => println(e.message())
 // ```
 pub fn describe(r: AvroResolution) -> Str []
-    todo("avro-nv.avroresolve.describe")
+    var lines: [Str] = []
+    say(r, label(r.reader), lines)
+    if list.len(lines) == 0
+        return "The reader reads the writer's data unchanged."
+    str.join(lines, " ")
+
+// The sentences for one plan and the plans under it.
+fn say(p: AvroResolution, path: Str, var lines: [Str])
+    let w = p.writer
+    let r = p.reader
+    if w.is_reference or r.is_reference
+        return
+    if avroschema.is_named(w.kind) and w.full_name != r.full_name
+        list.push(lines, "The writer's `${w.full_name}` is read as the reader's `${r.full_name}`.")
+    if is_kind(w.kind, AvroUnion)
+        for i in 0..list.len(p.nested)
+            if is_kind(r.kind, AvroUnion) and p.branch_map[i] != i
+                list.push(lines,
+                    "The writer's branch ${i} of the union at `${path}` is read as the reader's branch ${p.branch_map[i]}.")
+            say(p.nested[i], path, lines)
+        return
+    if is_kind(r.kind, AvroUnion)
+        list.push(lines,
+            "At `${path}` the writer's ${avroschema.type_name(w.kind)} is read as branch ${p.branch_map[0]} of the reader's union.")
+        say(p.nested[0], path, lines)
+        return
+    if not is_kind(w.kind, r.kind)
+        list.push(lines,
+            "`${path}` is promoted from ${avroschema.type_name(w.kind)} to ${avroschema.type_name(r.kind)}.")
+        return
+    match r.kind
+        AvroRecord =>
+            var n = 0
+            for s in p.steps
+                match s.action
+                    AvroSkipField    =>
+                        list.push(lines,
+                            "Field `${path}.${w.fields[s.writer_index].name}` is only in the writer's schema, and is skipped.")
+                    AvroDefaultField =>
+                        list.push(lines,
+                            "Field `${path}.${r.fields[s.reader_index].name}` is only in the reader's schema, and is filled from its default.")
+                    _                =>
+                        let wf = w.fields[s.writer_index]
+                        let rf = r.fields[s.reader_index]
+                        if wf.name != rf.name
+                            list.push(lines, "Field `${path}.${wf.name}` is read into field `${rf.name}`.")
+                        say(p.nested[n], path + "." + rf.name, lines)
+                        n += 1
+        AvroEnum   =>
+            for i in 0..list.len(w.symbols)
+                let to = r.symbols[p.symbol_map[i]]
+                if to != w.symbols[i]
+                    list.push(lines,
+                        "Symbol `${w.symbols[i]}` of `${path}` is not in the reader's enum, and reads as `${to}`.")
+        _          =>
+            for q in p.nested
+                say(q, path + "[]", lines)

@@ -1,31 +1,26 @@
 // avroerror.nv — one fault type over a schema language, a binary
 // encoding, a container file and a resolution check.
 //
-// Every body is a `todo()`.  The signatures are the design, and the
-// compiler checks them as claims; see the README for the stamp.
+// A position is either a place in a schema or a place in a stream.  A
+// schema fault happens at a dotted path such as
+// `com.example.User.address.zip`, which is what a person editing a
+// `.avsc` file needs.  A stream fault happens at a byte offset in a
+// block, which is what a person looking at a damaged file needs.
+// `AvroWhere` carries both, and a fault fills in whichever it has.
 //
-// A POSITION IS EITHER A PLACE IN A SCHEMA OR A PLACE IN A STREAM, and
-// they are not the same kind of thing.  A schema fault happens at a
-// named path — `com.example.User.address.zip` — which is what a person
-// editing a `.avsc` needs.  A stream fault happens at a byte offset in
-// a block, which is what a person looking at a damaged file needs.
-// `AvroWhere` carries both and a fault fills in whichever it has.
+// Avro's binary encoding has no markers in it.  A record is its
+// fields' encodings concatenated, with no field tag, no length and no
+// terminator.  A decoder reading with the wrong schema therefore does
+// not fail: it produces wrong values until it runs off the end of the
+// block.  That is why `avroresolve` is a separate check made before
+// decoding, and why a resolution fault is its own kind.
 //
-// AVRO'S BINARY ENCODING HAS NO MARKERS IN IT AT ALL.  A record is its
-// fields' encodings concatenated; there is no field tag, no length and
-// no terminator.  So a decoder reading with the wrong schema does not
-// fail — it produces WRONG VALUES, confidently, until it runs off the
-// end of the block.  That is the single most important fact about this
-// format, and it is why `avroresolve` exists as a separate typed check
-// rather than as something the decoder does as it goes.
-//
-// FOUR QUESTIONS, NOT ONE.  `is_corrupt` says the bytes are damaged,
-// `is_incomplete` says more bytes would help, `is_schema_error` says
-// the schema itself is wrong or the two schemas do not resolve, and
-// `is_unsupported` says the file is good and asks for a codec or a
-// logical type this build does not have.  A caller reports the four
-// differently: the third is a developer's problem and the fourth is a
-// build's.
+// Four questions sort the kinds.  `is_corrupt` says the bytes are
+// damaged, `is_incomplete` says more bytes would help,
+// `is_schema_error` says the schema is wrong or the two schemas do not
+// resolve, and `is_unsupported` says the file is good and asks for a
+// codec or a schema the caller did not supply.  `is_limit` answers a
+// fifth: whether a bound the caller chose was reached.
 
 // Where a fault was found.
 //
@@ -37,11 +32,11 @@
 //     println(w.path)
 // ```
 pub struct AvroWhere
-    // The dotted path into the schema — the record's full name and
-    // then each field, array element or map value on the way down —
-    // or `""` where the fault is not about a schema.
+    // The dotted path into the schema: the record's full name and
+    // then each field, array element or map value on the way down.
+    // `""` where the fault is not about a schema.
     path: Str
-    // Which block of a container file, 0-based, or `-1`.
+    // Which block of a container file, counted from 0, or `-1`.
     block: Int
     // The byte offset within that block, or from the start of the
     // input for a bare binary encoding.  `-1` where there is none.
@@ -56,7 +51,7 @@ pub struct AvroWhere
 //     println(avroerror.at_path("com.example.User").path)
 // ```
 pub fn at_path(path: Str) -> AvroWhere []
-    todo("avro-nv.avroerror.at_path")
+    AvroWhere { path: path, block: -1, offset: -1 }
 
 // A position in a stream, by block and byte offset.
 //
@@ -67,14 +62,13 @@ pub fn at_path(path: Str) -> AvroWhere []
 //     println("${avroerror.at_offset(3, 1024).block}")
 // ```
 pub fn at_offset(block: Int, offset: Int) -> AvroWhere []
-    todo("avro-nv.avroerror.at_offset")
+    AvroWhere { path: "", block: block, offset: offset }
 
 // A position with both, for a fault found decoding a known field of a
 // known block.
 //
-// The one a decoder actually produces most of the time, and the one
-// worth having: "the `zip` field of the third record in block 12" is
-// something a person can go and look at.
+// It is the position a decoder produces most often: "the `zip` field
+// in block 12, at byte 480" is something a person can go and look at.
 //
 // ```novo
 // use avroerror
@@ -83,12 +77,12 @@ pub fn at_offset(block: Int, offset: Int) -> AvroWhere []
 //     println(avroerror.at_both("User.zip", 12, 480).path)
 // ```
 pub fn at_both(path: Str, block: Int, offset: Int) -> AvroWhere []
-    todo("avro-nv.avroerror.at_both")
+    AvroWhere { path: path, block: block, offset: offset }
 
 // Why an Avro schema, datum or file could not be read.
 //
 // Every variant is prefixed `Avro`, because a variant is constructed
-// by NAME across a whole program.
+// by name across a whole program.
 //
 // ```novo
 // use avroerror
@@ -103,61 +97,51 @@ pub enum AvroFaultKind
     // A schema named a type that is neither a primitive, a complex
     // type, nor a name defined earlier in the same schema.
     AvroUnknownType(name: Str)
-    // A named type — record, enum or fixed — was defined twice with
-    // the same full name.
+    // A named type (record, enum or fixed) was defined twice with the
+    // same full name.
     AvroDuplicateName(name: Str)
-    // A name or namespace that is not a legal Avro name: it must start
-    // with a letter or underscore and continue with letters, digits
-    // and underscores.
+    // A name or namespace that is not a legal Avro name.  A name
+    // starts with a letter or an underscore and continues with
+    // letters, digits and underscores.
     AvroBadName(name: Str)
-    // A record field, enum symbol or fixed size that the schema left
-    // out or gave the wrong shape.
+    // A record field, enum symbol, fixed size or union branch that the
+    // schema left out, repeated or gave the wrong shape.
     AvroBadSchemaShape(detail: Str)
     // A field default whose JSON does not fit the field's type.
     //
-    // Checked when the schema is parsed rather than when the default
-    // is used, because a default that does not fit is a bug in the
-    // schema and the person who can fix it is reading the schema.
+    // It is checked when the schema is parsed, because a default that
+    // does not fit is a mistake in the schema.
     AvroBadDefault(field: Str)
     // A logical type whose annotation does not fit its underlying
-    // type — a `decimal` whose precision exceeds what its `fixed` can
-    // hold, a `duration` on something that is not a 12-byte `fixed`.
+    // type, such as a `decimal` whose precision is more than its
+    // `fixed` can hold.
     //
-    // NOT a refusal to read the file.  The specification says an
-    // unusable logical-type annotation is IGNORED and the underlying
-    // type is used, so this is what `avrological.of` answers rather
-    // than what a decoder raises.
+    // A decoder never raises it.  The specification says an unusable
+    // annotation is ignored and the underlying type is used, so only
+    // `avrological.check` answers it.
     AvroBadLogicalType(name: Str)
-    // A reader schema and a writer schema that do not resolve.
-    // Carries the rule that failed, in the specification's own words.
-    //
-    // THE FAULT THIS PACKAGE EXISTS TO MAKE EARLY.  Avro's binary
-    // encoding has no markers, so a mismatch that is not caught here
-    // is not caught at all — it is silently wrong values.
+    // A reader schema and a writer schema that do not resolve.  It
+    // carries the rule that failed.
     AvroNoResolution(detail: Str)
     // A reader field with no default that the writer's schema does not
-    // have.  Its own arm because it is the resolution failure people
-    // actually hit, and because the fix is always the same: give the
-    // field a default.
+    // have.  The fix is always the same: give the field a default.
     AvroMissingFieldNoDefault(field: Str)
     // A union branch index outside the union's range.
     AvroBadUnionIndex(index: Int, branches: Int)
-    // An enum symbol index outside the enum's range, with no
-    // `default` on the reader's enum to fall back to.
+    // An enum symbol index outside the enum's range.
     AvroBadEnumIndex(index: Int, symbols: Int)
-    // A variable-length integer that did not terminate, or one that
-    // encoded more than 64 bits.
+    // A variable-length integer that did not end within ten bytes, or
+    // one that encoded more than 64 bits.
     AvroBadVarint
-    // A negative length on a string, bytes or fixed value — which
-    // zigzag makes representable and the format does not allow.
+    // A negative length or count where the format allows none.
     AvroNegativeLength(got: Int)
-    // A length or block count above the caller's limit.  Carries both
-    // numbers.
+    // A length, count or depth above the caller's limit.  It carries
+    // both numbers.
     //
-    // NOT corruption.  Avro encodes a string's length as a varint
-    // before its bytes, so a damaged or hostile file can declare a
-    // two-gigabyte string in five bytes; the bound is the only thing
-    // between a caller and that allocation.
+    // It does not mean the bytes are damaged.  A string's length is a
+    // varint written before its bytes, so a damaged or hostile file
+    // can declare two gigabytes in five bytes, and the limit is what
+    // stands between a caller and that allocation.
     AvroLengthLimitReached(wanted: Int, allowed: Int)
     // A container file whose first four bytes were not `Obj` and
     // version 1.
@@ -166,37 +150,37 @@ pub enum AvroFaultKind
     // which the specification requires.
     AvroNoSchemaInFile
     // A container file block whose trailing sync marker did not match
-    // the file's.
-    //
-    // THE CHECK THAT MAKES A CONTAINER FILE SPLITTABLE.  The sync
-    // marker is what lets a reader start in the middle of a large file
-    // and find the next block boundary, and a marker that does not
-    // match means the reader is not where it thought it was.
+    // the file's.  The reader is not at the block boundary it thought
+    // it was at.
     AvroSyncMismatch(block: Int)
-    // A container file that names a codec this build cannot run.
-    // Carries the name.
+    // A container file that names a codec the caller did not supply.
+    // It carries the name.
     //
-    // NOT corruption.  `avro.codec` is an open set in the
-    // specification and implementations add to it, so a file from a
-    // newer writer is not a broken file.  `is_unsupported` answers
-    // true, and `avrocodec.codec_named` is how a caller supplies one.
+    // The file is not damaged: `avro.codec` is an open set, and a file
+    // from a newer writer may name a codec this caller has not wired
+    // in.
     AvroUnsupportedCodec(name: Str)
+    // A block whose checksum did not match its data, such as the
+    // CRC-32C that Avro's `snappy` framing puts after a block.  It
+    // carries the codec's name.
+    AvroChecksumMismatch(codec: Str)
     // A single-object encoding whose two-byte marker was not `C3 01`.
     AvroBadSingleObjectMarker
     // A single-object encoding whose fingerprint matches no schema the
-    // caller offered.  Carries the fingerprint, in hexadecimal.
+    // caller offered.  It carries the fingerprint in hexadecimal.
     AvroUnknownFingerprint(fingerprint: Str)
     // The input ended in the middle of a value or a block.
     //
-    // NOT corruption: it is what a decoder answers when the caller has
-    // not supplied the whole file yet.
+    // It does not mean the bytes are damaged.  It is what a decoder
+    // answers when the caller has not supplied the whole input yet.
     AvroTruncated
     // A caller-supplied buffer was too small.
     AvroBufferTooSmall(want: Int, have: Int)
     // A caller's parameter was outside the range the function
     // documents.
     AvroBadParameter(what: Str)
-    // The stream supplied to `avrofile.read_all` failed.
+    // The source a caller supplied failed.  No function in this
+    // release answers it.
     AvroSourceFailed
 
 // A fault, with the position it was found at.
@@ -216,10 +200,9 @@ pub struct AvroFault
 
 // How an `AvroFault` reads when a `Result` carrying one is reported.
 impl Error for AvroFault
-    // The one-line report: the reason, the schema path where there is
-    // one, and the block and offset where there is one.
+    // The one-line report: `describe`'s sentence.
     fn message(self) -> Str
-        todo("avro-nv.avroerror.AvroFault.message")
+        describe(self)
 
 // A fault from a kind and a position.
 //
@@ -231,13 +214,13 @@ impl Error for AvroFault
 //         avroerror.fault(AvroBadVarint, avroerror.at_offset(0, 3)).kind))
 // ```
 pub fn fault(kind: AvroFaultKind, at: AvroWhere) -> AvroFault []
-    todo("avro-nv.avroerror.fault")
+    AvroFault { kind: kind, at: at }
 
 // A short, stable name for a kind: `"unknown-type"`,
 // `"no-resolution"`, `"sync-mismatch"`.
 //
-// Stable because it goes in logs and in test expectations.
-// `describe` is the sentence.
+// The names are stable across releases, so a log or a test may match
+// on them.  `describe` is the sentence.
 //
 // ```novo
 // use avroerror
@@ -246,10 +229,64 @@ pub fn fault(kind: AvroFaultKind, at: AvroWhere) -> AvroFault []
 //     println(avroerror.kind_name(AvroTruncated))
 // ```
 pub fn kind_name(k: AvroFaultKind) -> Str []
-    todo("avro-nv.avroerror.kind_name")
+    match k
+        AvroSchemaNotJson(_)         => "schema-not-json"
+        AvroUnknownType(_)           => "unknown-type"
+        AvroDuplicateName(_)         => "duplicate-name"
+        AvroBadName(_)               => "bad-name"
+        AvroBadSchemaShape(_)        => "bad-schema-shape"
+        AvroBadDefault(_)            => "bad-default"
+        AvroBadLogicalType(_)        => "bad-logical-type"
+        AvroNoResolution(_)          => "no-resolution"
+        AvroMissingFieldNoDefault(_) => "missing-field-no-default"
+        AvroBadUnionIndex(_, _)      => "bad-union-index"
+        AvroBadEnumIndex(_, _)       => "bad-enum-index"
+        AvroBadVarint                => "bad-varint"
+        AvroNegativeLength(_)        => "negative-length"
+        AvroLengthLimitReached(_, _) => "length-limit-reached"
+        AvroBadFileMagic             => "bad-file-magic"
+        AvroNoSchemaInFile           => "no-schema-in-file"
+        AvroSyncMismatch(_)          => "sync-mismatch"
+        AvroUnsupportedCodec(_)      => "unsupported-codec"
+        AvroChecksumMismatch(_)      => "checksum-mismatch"
+        AvroBadSingleObjectMarker    => "bad-single-object-marker"
+        AvroUnknownFingerprint(_)    => "unknown-fingerprint"
+        AvroTruncated                => "truncated"
+        AvroBufferTooSmall(_, _)     => "buffer-too-small"
+        AvroBadParameter(_)          => "bad-parameter"
+        AvroSourceFailed             => "source-failed"
 
-// One English sentence saying what went wrong and where, with every
-// string and number the variant carries in it.
+// What a kind says, as the first half of `describe`'s sentence.
+fn reason(k: AvroFaultKind) -> Str
+    match k
+        AvroSchemaNotJson(d)         => "the schema is not JSON: ${d}"
+        AvroUnknownType(n)           => "`${n}` is not a type this schema defines"
+        AvroDuplicateName(n)         => "`${n}` is defined twice"
+        AvroBadName(n)               => "`${n}` is not a legal Avro name"
+        AvroBadSchemaShape(d)        => "the schema is malformed: ${d}"
+        AvroBadDefault(f)            => "the default of field `${f}` does not fit its type"
+        AvroBadLogicalType(n)        => "the logical type `${n}` does not fit its underlying type and is ignored"
+        AvroNoResolution(d)          => "the schemas do not resolve: ${d}"
+        AvroMissingFieldNoDefault(f) => "the reader's field `${f}` is not in the writer's schema and has no default"
+        AvroBadUnionIndex(i, n)      => "union branch ${i} is outside a union of ${n} branches"
+        AvroBadEnumIndex(i, n)       => "enum symbol ${i} is outside an enum of ${n} symbols"
+        AvroBadVarint                => "a variable-length integer is longer than 64 bits"
+        AvroNegativeLength(n)        => "a length of ${n} is negative"
+        AvroLengthLimitReached(w, a) => "${w} is above the limit of ${a}"
+        AvroBadFileMagic             => "the input does not start with `Obj` and version 1"
+        AvroNoSchemaInFile           => "the file's metadata has no `avro.schema`"
+        AvroSyncMismatch(b)          => "block ${b} does not end with the file's sync marker"
+        AvroUnsupportedCodec(n)      => "the codec `${n}` was not supplied"
+        AvroChecksumMismatch(n)      => "a `${n}` block does not match its checksum"
+        AvroBadSingleObjectMarker    => "the input does not start with the single-object marker C3 01"
+        AvroUnknownFingerprint(fp)   => "no schema offered has the fingerprint ${fp}"
+        AvroTruncated                => "the input ends in the middle of a value"
+        AvroBufferTooSmall(w, h)     => "the buffer holds ${h} bytes and ${w} are needed"
+        AvroBadParameter(what)       => "a parameter is out of range: ${what}"
+        AvroSourceFailed             => "the source failed"
+
+// One sentence saying what went wrong and where, with every string and
+// number the variant carries in it.
 //
 // ```novo
 // use avroerror
@@ -259,9 +296,16 @@ pub fn kind_name(k: AvroFaultKind) -> Str []
 //         avroerror.fault(AvroUnknownType("Colour"), avroerror.at_path("User"))))
 // ```
 pub fn describe(f: AvroFault) -> Str []
-    todo("avro-nv.avroerror.describe")
+    var out = reason(f.kind)
+    if f.at.path != ""
+        out = out + ", at `${f.at.path}`"
+    if f.at.block >= 0
+        out = out + ", in block ${f.at.block}"
+    if f.at.offset >= 0
+        out = out + ", at byte ${f.at.offset}"
+    out
 
-// Whether the BYTES are damaged.
+// Whether the bytes are damaged.
 //
 // ```novo
 // use avroerror
@@ -270,7 +314,17 @@ pub fn describe(f: AvroFault) -> Str []
 //     println("${avroerror.is_corrupt(AvroBadVarint)}")
 // ```
 pub fn is_corrupt(k: AvroFaultKind) -> Bool []
-    todo("avro-nv.avroerror.is_corrupt")
+    match k
+        AvroBadUnionIndex(_, _)   => true
+        AvroBadEnumIndex(_, _)    => true
+        AvroBadVarint             => true
+        AvroNegativeLength(_)     => true
+        AvroBadFileMagic          => true
+        AvroNoSchemaInFile        => true
+        AvroSyncMismatch(_)       => true
+        AvroChecksumMismatch(_)   => true
+        AvroBadSingleObjectMarker => true
+        _                         => false
 
 // Whether more bytes could turn this into a success.
 //
@@ -283,13 +337,15 @@ pub fn is_corrupt(k: AvroFaultKind) -> Bool []
 //     println("${avroerror.is_incomplete(AvroTruncated)}")
 // ```
 pub fn is_incomplete(k: AvroFaultKind) -> Bool []
-    todo("avro-nv.avroerror.is_incomplete")
+    match k
+        AvroTruncated => true
+        _             => false
 
-// Whether the SCHEMA is wrong, or the two schemas do not resolve.
+// Whether the schema is wrong, or the two schemas do not resolve.
 //
-// True for every parse-time arm and for both resolution arms.  A
-// developer's problem, not a file's and not a build's — which is why
-// it is a separate question from the other three.
+// True for every fault `avroschema.parse` answers, for the two
+// resolution faults and for `AvroBadLogicalType`.  It is a
+// developer's problem, not a file's and not a build's.
 //
 // ```novo
 // use avroerror
@@ -299,14 +355,23 @@ pub fn is_incomplete(k: AvroFaultKind) -> Bool []
 //     println("${yes}")
 // ```
 pub fn is_schema_error(k: AvroFaultKind) -> Bool []
-    todo("avro-nv.avroerror.is_schema_error")
+    match k
+        AvroSchemaNotJson(_)         => true
+        AvroUnknownType(_)           => true
+        AvroDuplicateName(_)         => true
+        AvroBadName(_)               => true
+        AvroBadSchemaShape(_)        => true
+        AvroBadDefault(_)            => true
+        AvroBadLogicalType(_)        => true
+        AvroNoResolution(_)          => true
+        AvroMissingFieldNoDefault(_) => true
+        _                            => false
 
-// Whether the file is GOOD and asks for something this build does not
-// have.
+// Whether the file is good and asks for something the caller did not
+// supply.
 //
 // True for `AvroUnsupportedCodec` and `AvroUnknownFingerprint`.  Both
-// name something a caller can supply — a codec value, a schema — so
-// the answer is "wire that up", not "that file is broken".
+// name something a caller can supply, a codec value or a schema.
 //
 // ```novo
 // use avroerror
@@ -316,7 +381,10 @@ pub fn is_schema_error(k: AvroFaultKind) -> Bool []
 //     println("${yes}")
 // ```
 pub fn is_unsupported(k: AvroFaultKind) -> Bool []
-    todo("avro-nv.avroerror.is_unsupported")
+    match k
+        AvroUnsupportedCodec(_)   => true
+        AvroUnknownFingerprint(_) => true
+        _                         => false
 
 // Whether the fault is a bound this program chose.
 //
@@ -329,4 +397,7 @@ pub fn is_unsupported(k: AvroFaultKind) -> Bool []
 //     println("${avroerror.is_limit(AvroBufferTooSmall(64, 8))}")
 // ```
 pub fn is_limit(k: AvroFaultKind) -> Bool []
-    todo("avro-nv.avroerror.is_limit")
+    match k
+        AvroLengthLimitReached(_, _) => true
+        AvroBufferTooSmall(_, _)     => true
+        _                            => false

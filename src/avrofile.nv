@@ -1,48 +1,40 @@
 // avrofile.nv — the object container file: a schema in the header,
-// blocks of records, and a random sync marker that makes it
-// splittable.
+// blocks of records, and a sync marker that makes the file splittable.
 //
-// Every body is a `todo()`.  The signatures are the design, and the
-// compiler checks them as claims; see the README for the stamp.
+// A file is four things (specification section "Object Container
+// Files"): the four magic bytes `O`, `b`, `j` and 1; a map of metadata;
+// a sixteen-byte sync marker; and then blocks.  Each block is a record
+// count, a byte size, the records' encodings, compressed by the file's
+// codec, and the file's sync marker again.
 //
-// THE FILE IS FOUR THINGS.  Four magic bytes — `O`, `b`, `j`, `1` — a
-// map of metadata, a sixteen-byte SYNC MARKER, and then blocks.  Each
-// block is a record count, a byte size, the records' encodings
-// concatenated, and the file's sync marker again.
+// The sync marker is sixteen random bytes chosen by the writer, and
+// every block ends with it.  A reader handed the middle of a file scans
+// forward for the marker, and the byte after it starts a block, so a
+// large file can be split at arbitrary offsets and each piece read on
+// its own.  `sync_after` is that scan.
 //
-// THE SYNC MARKER IS WHY THIS FORMAT EXISTS.  It is sixteen random
-// bytes chosen by the writer, and every block ends with it.  A reader
-// handed the middle of a file scans forward for the marker, and the
-// next byte after it starts a block — so a five-gigabyte Avro file can
-// be split at arbitrary byte offsets and each piece read
-// independently.  That is what makes Avro the format Hadoop and every
-// system after it used for bulk data, and nothing else in the format
-// matters as much.
+// The marker must be random, and this package cannot make one: it is
+// `core` and has no `[rand]`, and a fixed marker would one day appear
+// inside somebody's data and split a file in the wrong place.
+// `writer` takes the sixteen bytes from the caller.
 //
-// SO THE MARKER MUST BE RANDOM, AND THIS PACKAGE CANNOT MAKE ONE.
-// `core` has no `[rand]`, and a hard-coded marker would appear inside
-// somebody's data and split a file in the wrong place.  The caller
-// supplies sixteen bytes — `avrofile.writer` takes them — and spends
-// its own `[rand]` where it is visible.  That is the same shape jwt-nv
-// uses for the clock and sql-engine-nv for `NowSnapshot`.
+// The metadata carries the schema under `avro.schema`, which is
+// required, and the codec under `avro.codec`, which means `"null"`
+// when absent.  Every other key is the writer's own, and `read_header`
+// keeps it.
 //
-// THE METADATA CARRIES THE SCHEMA, and `avro.schema` is required.  A
-// file without it is not readable at all, by anybody, which is why it
-// is its own fault kind.  `avro.codec` is optional and means `"null"`
-// when absent.  Everything else is the writer's, and this package
-// keeps it: a caller's own metadata survives a read-and-write round
-// trip.
-//
-// A BLOCK'S COUNT AND ITS BYTE SIZE ARE BOTH DECLARED, which is what
-// makes a block skippable: a reader filtering a file can step over a
-// block it does not want without decoding one record of it.
+// A block declares both its record count and its byte size, so a
+// reader can step over a block without decoding a record of it.
 
+use std.bytes
+use avrobinary
 use avrocodec
 use avroerror
+use avroresolve
 use avroschema
 use avrovalue
 
-// The four magic bytes a container file starts with: `Obj` and `1`.
+// The four magic bytes a container file starts with: `Obj` and 1.
 pub const AVRO_FILE_MAGIC_BYTES = 4
 
 // The sync marker's length: 16 bytes.
@@ -50,13 +42,17 @@ pub const AVRO_SYNC_BYTES = 16
 
 // The metadata key the schema is under: `"avro.schema"`.
 //
-// Required.  A file without it cannot be read by anybody.
+// Required.  A file without it cannot be read.
 pub const AVRO_META_SCHEMA = "avro.schema"
 
 // The metadata key the codec is under: `"avro.codec"`.
 //
-// Optional, and means `"null"` when absent.
+// Optional, and `"null"` when absent.
 pub const AVRO_META_CODEC = "avro.codec"
+
+// The four magic bytes.
+fn magic() -> Bytes
+    bytes.from_byte_list([79, 98, 106, 1])
 
 // A container file's header: its metadata, its schema and its sync
 // marker.
@@ -71,7 +67,7 @@ pub const AVRO_META_CODEC = "avro.codec"
 //         Err(e) => println(e.message())
 // ```
 pub struct AvroFileHeader
-    // The writer's schema, already parsed.
+    // The writer's schema, parsed.
     schema: AvroSchema
     // The codec name from `avro.codec`, or `"null"` when the key was
     // absent.
@@ -80,19 +76,24 @@ pub struct AvroFileHeader
     sync: Bytes
     // Every metadata key, in the order the file carried them.
     meta_keys: [Str]
-    // Every metadata value, as bytes — because the format says the
-    // values are `bytes` and a caller's own metadata need not be text.
+    // Every metadata value, as bytes: the format says the values are
+    // `bytes`, and a writer's own metadata need not be text.
     meta_values: [Bytes]
-    // How many bytes the header occupied, so a reader knows where the
-    // first block starts.
+    // How many bytes the header occupied, which is where the first
+    // block starts.
     header_bytes: Int
+
+// A fault at an offset of the file, outside any block.
+fn at_file(kind: AvroFaultKind, at: Int) -> AvroFault
+    avroerror.fault(kind, avroerror.at_offset(-1, at))
 
 // Read a container file's header from the start of `src`.
 //
-// `AvroBadFileMagic`, which `avroerror.is_corrupt` calls damage, when
-// the first four bytes are not `Obj` and version 1; `AvroNoSchemaInFile` when the metadata has no
-// `avro.schema`, and whatever `avroschema.parse` answers for a schema
-// that does not parse.
+// `AvroBadFileMagic`, which `avroerror.is_corrupt` answers true for,
+// when the first four bytes are not `Obj` and 1.  `AvroNoSchemaInFile`
+// when the metadata has no `avro.schema`, and whatever
+// `avroschema.parse` answers for a schema that does not parse.
+// `AvroTruncated` when the input ends inside the header.
 //
 // ```novo
 // use std.bytes
@@ -104,7 +105,45 @@ pub struct AvroFileHeader
 //         Err(e) => println(e.message())
 // ```
 pub fn read_header(src: Bytes) -> Result<AvroFileHeader, AvroFault> []
-    todo("avro-nv.avrofile.read_header")
+    let n = math.min(bytes.len(src), AVRO_FILE_MAGIC_BYTES)
+    if bytes.slice(src, 0, n) != bytes.slice(magic(), 0, n)
+        return Err(at_file(AvroBadFileMagic, 0))
+    if n < AVRO_FILE_MAGIC_BYTES
+        return Err(at_file(AvroTruncated, n))
+    let w = Walk { defs: [], src: src, limits: avrobinary.default_limits(), build: true }
+    let meta = avrobinary.walk(w, meta_schema(), AVRO_FILE_MAGIC_BYTES, 0, "metadata")
+    if let Some(f) = meta.fault
+        return Err(f)
+    var keys: [Str] = []
+    var raw: [Bytes] = []
+    if let AvroMapValue(ks, vs) = meta.value
+        keys = ks[:]
+        for v in vs
+            if let AvroBytesValue(b) = v
+                list.push(raw, bytes.clone(b))
+    if meta.at + AVRO_SYNC_BYTES > bytes.len(src)
+        return Err(at_file(AvroTruncated, meta.at))
+    let h = AvroFileHeader { schema: avroschema.primitive(AvroNull), codec: "null",
+                             sync: bytes.slice(src, meta.at, meta.at + AVRO_SYNC_BYTES),
+                             meta_keys: keys, meta_values: raw,
+                             header_bytes: meta.at + AVRO_SYNC_BYTES }
+    let Some(text) = meta_of(keys, raw, AVRO_META_SCHEMA) else
+        return Err(at_file(AvroNoSchemaInFile, AVRO_FILE_MAGIC_BYTES))
+    let schema = avroschema.parse(bytes.to_str(text))!
+    let codec = bytes.to_str(meta_of(keys, raw, AVRO_META_CODEC) ?? bytes.from_str("null"))
+    Ok(AvroFileHeader { schema: schema, codec: codec, sync: h.sync, meta_keys: keys, meta_values: raw,
+                        header_bytes: h.header_bytes })
+
+// The schema of the metadata: a map of bytes.
+fn meta_schema() -> AvroSchema
+    avroschema.built(AvroMap, "", [], "", [], [], "", [avroschema.primitive(AvroBytes)], [], 0)
+
+// A metadata value by key, from the two lists.
+fn meta_of(keys: [Str], values: [Bytes], key: Str) -> ?Bytes
+    for i in 0..list.len(keys)
+        if keys[i] == key
+            return Some(bytes.clone(values[i]))
+    None
 
 // A metadata value by key, or `None`.
 //
@@ -121,14 +160,12 @@ pub fn read_header(src: Bytes) -> Result<AvroFileHeader, AvroFault> []
 //         Err(e) => println(e.message())
 // ```
 pub fn meta(h: AvroFileHeader, key: Str) -> ?Bytes []
-    todo("avro-nv.avrofile.meta")
+    meta_of(h.meta_keys, h.meta_values, key)
 
 // Whether a file's blocks can be read with the codecs a caller
 // supplied.
 //
-// THE QUESTION TO ASK OVER A HEADER, before reading a single block.  A
-// file whose codec is `snappy` and a build with no Snappy is a
-// refusal that should happen at open time and name the codec.
+// It is the question to ask over a header, before reading a block.
 //
 // ```novo
 // use std.bytes
@@ -141,14 +178,10 @@ pub fn meta(h: AvroFileHeader, key: Str) -> ?Bytes []
 //         Err(e) => println(e.message())
 // ```
 pub fn readable_with(h: AvroFileHeader, supplied: [AvroCodec]) -> Bool []
-    todo("avro-nv.avrofile.readable_with")
+    avrocodec.can_read(supplied, h.codec)
 
 // One block's header: how many records, and how many bytes they
 // occupy.
-//
-// BOTH ARE DECLARED, which is what makes a block skippable: a reader
-// filtering a file steps over a block it does not want without
-// decoding one record of it.
 //
 // ```novo
 // use avrofile
@@ -159,7 +192,7 @@ pub fn readable_with(h: AvroFileHeader, supplied: [AvroCodec]) -> Bool []
 pub struct AvroBlockHeader
     // How many records the block holds.
     count: Int
-    // How many bytes the records occupy, AFTER compression.
+    // How many bytes the records occupy, after compression.
     byte_size: Int
     // Where in the file the records' bytes start.
     data_at: Int
@@ -173,13 +206,13 @@ pub struct AvroBlockHeader
 //     println("${avrofile.block(100, 4096, 64).data_at}")
 // ```
 pub fn block(count: Int, byte_size: Int, data_at: Int) -> AvroBlockHeader []
-    todo("avro-nv.avrofile.block")
+    AvroBlockHeader { count: count, byte_size: byte_size, data_at: data_at }
 
 // A reader over a container file, between blocks.
 //
-// Carried by value: `next_block` answers the next one.  The reader
-// holds the header, the codecs and the counts; the file's bytes stay
-// the caller's.
+// It is carried by value: `read_block` and `skip_block` answer the
+// next one.  The reader holds the header, the codecs and the counts,
+// and the file's bytes stay the caller's.
 //
 // ```novo
 // use std.bytes
@@ -202,15 +235,14 @@ pub struct AvroReader
     blocks: Int
     // How many records have been read, across every block.
     records: Int
-    // The plan a reader schema was resolved to, or absent when the
-    // caller reads with the writer's own schema.
+    // The plan a reader schema was resolved to, or `None` when the
+    // records are read with the writer's own schema.
     plan: ?AvroResolution
 
 // A reader over a whole container file held in memory.
 //
-// `readable_with` is checked here, so a file whose codec the caller
-// did not supply is refused at open rather than on block four
-// thousand.
+// `readable_with` is checked here: `AvroUnsupportedCodec` names a codec
+// the caller did not supply, when the file is opened.
 //
 // ```novo
 // use std.bytes
@@ -223,15 +255,22 @@ pub struct AvroReader
 //         Err(e) => println(e.message())
 // ```
 pub fn reader(src: Bytes, supplied: [AvroCodec]) -> Result<AvroReader, AvroFault> []
-    todo("avro-nv.avrofile.reader")
+    let h = read_header(src)!
+    if not readable_with(h, supplied)
+        return Err(at_file(AvroUnsupportedCodec(h.codec), 0))
+    Ok(AvroReader { header: h,
+        codecs: supplied,
+        at: h.header_bytes,
+        blocks: 0,
+        records: 0,
+        plan: None })
 
 // A reader that decodes through a reader schema rather than the
 // writer's.
 //
-// `avroresolve.resolve` is run HERE, once, against the file's own
-// schema — so a file that cannot be read through the caller's schema
-// is refused at open, with the rule that failed named, rather than
-// producing wrong values.  That is the whole point of this package.
+// `avroresolve.resolve` runs here, once, against the file's own
+// schema, so a file that cannot be read through the caller's schema is
+// refused when it is opened, with the rule that failed named.
 //
 // ```novo
 // use std.bytes
@@ -250,9 +289,35 @@ pub fn reader(src: Bytes, supplied: [AvroCodec]) -> Result<AvroReader, AvroFault
 // ```
 pub fn reader_with_schema(src: Bytes, supplied: [AvroCodec],
                           reader_schema: AvroSchema) -> Result<AvroReader, AvroFault> []
-    todo("avro-nv.avrofile.reader_with_schema")
+    let r = reader(src, supplied)!
+    let p = avroresolve.resolve(r.header.schema, reader_schema)!
+    Ok(AvroReader { header: r.header,
+        codecs: r.codecs,
+        at: r.at,
+        blocks: 0,
+        records: 0,
+        plan: Some(p) })
 
-// Read the next block's header, or `None` at end of file.
+// Whether the reader has reached the end of the file.
+//
+// ```novo
+// use std.bytes
+// use avrocodec
+// use avrofile
+//
+// fn main() [io]
+//     match avrofile.reader(bytes.zeros(64), avrocodec.only_null())
+//         Ok(r)  => println("${avrofile.at_end(r, bytes.zeros(64))}")
+//         Err(e) => println(e.message())
+// ```
+pub fn at_end(r: AvroReader, src: Bytes) -> Bool []
+    r.at >= bytes.len(src)
+
+// Read the next block's header.
+//
+// `AvroTruncated` at the end of the file, and when the block's records
+// or its sync marker run past the end of the input; `at_end` asks
+// first.  `AvroNegativeLength` for a negative count or size.
 //
 // ```novo
 // use std.bytes
@@ -268,14 +333,32 @@ pub fn reader_with_schema(src: Bytes, supplied: [AvroCodec],
 //         Err(e) => println(e.message())
 // ```
 pub fn next_block(r: AvroReader, src: Bytes) -> Result<AvroBlockHeader, AvroFault> []
-    todo("avro-nv.avrofile.next_block")
+    let at = avroerror.at_offset(r.blocks, r.at)
+    let count = avrobinary.read_long(src, avrobinary.cursor(r.at))
+    let size = avrobinary.read_long(src, count.cursor)
+    if let Some(f) = avrobinary.fault_of(size.cursor, r.blocks)
+        return Err(f)
+    if count.value < 0 or size.value < 0
+        return Err(avroerror.fault(AvroNegativeLength(math.min(count.value, size.value)), at))
+    let data_at = size.cursor.at
+    if data_at + size.value + AVRO_SYNC_BYTES > bytes.len(src)
+        return Err(avroerror.fault(AvroTruncated, at))
+    Ok(block(count.value, size.value, data_at))
+
+// Check the sync marker after a block's records.
+fn check_sync(r: AvroReader, src: Bytes, b: AvroBlockHeader) -> Result<Int, AvroFault>
+    let end = b.data_at + b.byte_size
+    if bytes.slice(src, end, end + AVRO_SYNC_BYTES) != r.header.sync
+        return Err(avroerror.fault(AvroSyncMismatch(r.blocks), avroerror.at_offset(r.blocks, end)))
+    Ok(end + AVRO_SYNC_BYTES)
 
 // Decode a whole block's records, answering them and the reader after
 // it.
 //
-// Checks the block's trailing sync marker against the file's, which is
-// `AvroSyncMismatch` when it does not agree — the check that says a
-// reader is where it thought it was.
+// It checks the block's trailing sync marker against the file's
+// first: `AvroSyncMismatch` when they differ.  `limit` bounds the
+// block's decompressed size, and `-1` is no bound.  A record that does
+// not decode answers its fault placed in this block.
 //
 // ```novo
 // use std.bytes
@@ -291,7 +374,30 @@ pub fn next_block(r: AvroReader, src: Bytes) -> Result<AvroBlockHeader, AvroFaul
 //         Err(e) => println(e.message())
 // ```
 pub fn read_block(r: AvroReader, src: Bytes, limit: Int) -> Result<AvroBlock, AvroFault> []
-    todo("avro-nv.avrofile.read_block")
+    let b = next_block(r, src)!
+    let next = check_sync(r, src, b)!
+    let limits = avrobinary.default_limits()
+    if b.count > limits.max_items
+        return Err(avroerror.fault(AvroLengthLimitReached(b.count, limits.max_items),
+                                   avroerror.at_offset(r.blocks, b.data_at)))
+    // `reader` refused the file unless its codec was among those
+    // supplied, so the lookup finds it.
+    let c = avrocodec.codec_named(r.codecs, r.header.codec) ?? avrocodec.null_codec()
+    let data = avrocodec.decompress(c, src, b.data_at, b.byte_size, limit)!
+    let defs = avroschema.defs_of(r.header.schema)
+    var records: [AvroValue] = []
+    var at = 0
+    for _ in 0..b.count
+        let d = match r.plan
+            Some(p) => avroresolve.decode_at(data, at, p, limits)
+            None    => avrobinary.decode_at(defs, data, at, r.header.schema, limits)
+        if let Some(f) = d.fault
+            return Err(avroerror.fault(f.kind, avroerror.at_both(f.at.path, r.blocks, f.at.offset)))
+        list.push(records, d.value)
+        at = d.at
+    let after = AvroReader { header: r.header, codecs: r.codecs, at: next, blocks: r.blocks + 1,
+                             records: r.records + b.count, plan: r.plan }
+    Ok(AvroBlock { records: records, reader: after })
 
 // One decoded block: its records and the reader after it.
 //
@@ -316,8 +422,8 @@ pub struct AvroBlock
 
 // Skip the next block without decoding a record of it.
 //
-// What makes a filtering read cheap: the block header declares its
-// byte size, so a reader that does not want this block steps over it.
+// The block header declares its byte size, so a reader that does not
+// want the block steps over it.  The sync marker is still checked.
 //
 // ```novo
 // use std.bytes
@@ -333,9 +439,12 @@ pub struct AvroBlock
 //         Err(e) => println(e.message())
 // ```
 pub fn skip_block(r: AvroReader, src: Bytes) -> Result<AvroReader, AvroFault> []
-    todo("avro-nv.avrofile.skip_block")
+    let b = next_block(r, src)!
+    let next = check_sync(r, src, b)!
+    Ok(AvroReader { header: r.header, codecs: r.codecs, at: next, blocks: r.blocks + 1,
+                    records: r.records + b.count, plan: r.plan })
 
-// How many blocks the reader has read.
+// How many blocks the reader has read or skipped.
 //
 // ```novo
 // use std.bytes
@@ -348,9 +457,9 @@ pub fn skip_block(r: AvroReader, src: Bytes) -> Result<AvroReader, AvroFault> []
 //         Err(e) => println(e.message())
 // ```
 pub fn blocks_read(r: AvroReader) -> Int []
-    todo("avro-nv.avrofile.blocks_read")
+    r.blocks
 
-// How many records the reader has read, across every block.
+// How many records the reader has read or skipped, across every block.
 //
 // ```novo
 // use std.bytes
@@ -363,17 +472,15 @@ pub fn blocks_read(r: AvroReader) -> Int []
 //         Err(e) => println(e.message())
 // ```
 pub fn records_read(r: AvroReader) -> Int []
-    todo("avro-nv.avrofile.records_read")
+    r.records
 
-// The offset of the first block boundary at or after `from`.
+// The offset of the first block boundary after a sync marker found at
+// or after `from`, or `-1` when there is none.
 //
-// THE FUNCTION THE SYNC MARKER EXISTS FOR.  A reader handed the middle
-// of a five-gigabyte file scans forward for the marker; the byte after
-// it starts a block.  Answers `-1` when no marker is found.
-//
-// The caller passes the marker rather than a reader, because the point
-// of this call is that the caller has NOT read the header — it has a
-// slice of a file and the marker from somewhere else.
+// A reader handed the middle of a file scans forward for the marker,
+// and a block starts at the byte after it.  The caller passes the
+// marker, because the point of the call is that it has not read the
+// header.
 //
 // ```novo
 // use std.bytes
@@ -383,13 +490,14 @@ pub fn records_read(r: AvroReader) -> Int []
 //     println("${avrofile.sync_after(bytes.zeros(64), 0, bytes.zeros(16))}")
 // ```
 pub fn sync_after(src: Bytes, from: Int, sync: Bytes) -> Int []
-    todo("avro-nv.avrofile.sync_after")
+    match bytes.find(src, sync, from)
+        Some(i) => i + bytes.len(sync)
+        None    => -1
 
 // Read every record of a whole container file held in memory.
 //
-// The convenience over the block walk, for a caller that wants the
-// records and not the structure.  `limit` bounds the total number of
-// records, and `-1` is unbounded.
+// `limit` bounds the total number of records, and `-1` is no bound:
+// `AvroLengthLimitReached` when the file holds more.
 //
 // ```novo
 // use std.bytes
@@ -402,9 +510,17 @@ pub fn sync_after(src: Bytes, from: Int, sync: Bytes) -> Int []
 //         Err(e) => println(e.message())
 // ```
 pub fn read_all(src: Bytes, supplied: [AvroCodec], limit: Int) -> Result<[AvroValue], AvroFault> []
-    todo("avro-nv.avrofile.read_all")
+    var r = reader(src, supplied)!
+    var out: [AvroValue] = []
+    while not at_end(r, src)
+        let b = read_block(r, src, avrobinary.default_limits().max_length)!
+        list.append(out, b.records)
+        if limit >= 0 and list.len(out) > limit
+            return Err(at_file(AvroLengthLimitReached(list.len(out), limit), r.at))
+        r = b.reader
+    Ok(out)
 
-// A writer over a container file.
+// A writer of a container file.
 //
 // ```novo
 // use std.bytes
@@ -427,7 +543,8 @@ pub struct AvroWriter
     codec: AvroCodec
     // The sixteen-byte sync marker, the caller's.
     sync: Bytes
-    // How many records a block holds before it is flushed.
+    // How many records a block holds before it is written.  100 unless
+    // `with_block_records` says otherwise.
     block_records: Int
     // The records buffered for the next block.
     buffered: [AvroValue]
@@ -436,13 +553,9 @@ pub struct AvroWriter
 
 // A writer, with the sync marker the caller supplies.
 //
-// SIXTEEN RANDOM BYTES, AND THIS PACKAGE CANNOT MAKE THEM.  `core` has
-// no `[rand]`, and a hard-coded marker would one day appear inside
-// somebody's data and split a file in the wrong place.  So the caller
-// spends its own `[rand]`, once, where it is visible.
-//
-// `AvroBadParameter` for a marker that is not sixteen bytes, and for a
-// codec whose `can_write` is false.
+// The marker is sixteen random bytes, which the caller makes with its
+// own `[rand]`.  `AvroBadParameter` for a marker that is not sixteen
+// bytes, and for a codec whose `can_write` is false.
 //
 // ```novo
 // use std.bytes
@@ -459,9 +572,19 @@ pub struct AvroWriter
 //         Err(e) => println(e.message())
 // ```
 pub fn writer(schema: AvroSchema, codec: AvroCodec, sync: Bytes) -> Result<AvroWriter, AvroFault> []
-    todo("avro-nv.avrofile.writer")
+    if bytes.len(sync) != AVRO_SYNC_BYTES
+        return Err(at_file(AvroBadParameter("a sync marker is 16 bytes"), -1))
+    if not avrocodec.can_write(codec)
+        return Err(at_file(AvroBadParameter("the codec `${codec.name}` cannot write"), -1))
+    Ok(AvroWriter { schema: schema,
+        codec: codec,
+        sync: sync,
+        block_records: 100,
+        buffered: [],
+        blocks: 0 })
 
-// The same writer with a different block size, in records.
+// The same writer with a different block size, in records.  A size
+// below 1 is taken as 1.
 //
 // ```novo
 // use std.bytes
@@ -478,11 +601,15 @@ pub fn writer(schema: AvroSchema, codec: AvroCodec, sync: Bytes) -> Result<AvroW
 //         Err(e) => println(e.message())
 // ```
 pub fn with_block_records(w: AvroWriter, n: Int) -> AvroWriter []
-    todo("avro-nv.avrofile.with_block_records")
+    AvroWriter { schema: w.schema, codec: w.codec, sync: w.sync, block_records: math.max(n, 1),
+                 buffered: w.buffered, blocks: w.blocks }
 
-// The file header's bytes, plus any metadata the caller wants kept.
+// The file header's bytes, with the caller's own metadata after the
+// schema and the codec.
 //
-// Written once, before the first block.
+// It is written once, before the first block.  `AvroBadParameter` when
+// the two lists differ in length, and for a key starting `avro.`,
+// which the specification reserves.
 //
 // ```novo
 // use std.bytes
@@ -503,13 +630,25 @@ pub fn with_block_records(w: AvroWriter, n: Int) -> AvroWriter []
 // ```
 pub fn header_bytes(w: AvroWriter, meta_keys: [Str],
                     meta_values: [Bytes]) -> Result<Bytes, AvroFault> []
-    todo("avro-nv.avrofile.header_bytes")
+    if list.len(meta_keys) != list.len(meta_values)
+        return Err(at_file(AvroBadParameter("the metadata keys and values differ in number"), -1))
+    var keys = [AVRO_META_SCHEMA, AVRO_META_CODEC]
+    var values = [AvroBytesValue(bytes.from_str(avroschema.to_json(w.schema))),
+                  AvroBytesValue(bytes.from_str(w.codec.name))]
+    for i in 0..list.len(meta_keys)
+        if str.starts_with(meta_keys[i], "avro.")
+            return Err(at_file(AvroBadParameter("the key `${meta_keys[i]}` is reserved"), -1))
+        list.push(keys, meta_keys[i])
+        list.push(values, AvroBytesValue(meta_values[i]))
+    let meta = avrobinary.encode(AvroMapValue(keys, values), meta_schema())!
+    Ok(magic() + meta + w.sync)
 
 // Give the writer a record, and take a block when one fills.
 //
-// Answers the writer to append the next record to and the bytes this
-// record completed — which is nothing until a block fills, then a
-// whole block at once.  The mirror of a decompressor's `feed`.
+// Answers the writer to append the next record to, and the bytes this
+// record completed: nothing until a block fills, and then the whole
+// block.  `AvroBadSchemaShape` when the record does not fit the
+// writer's schema.
 //
 // ```novo
 // use std.bytes
@@ -523,14 +662,38 @@ pub fn header_bytes(w: AvroWriter, meta_keys: [Str],
 //         Ok(s) =>
 //             match avrofile.writer(s, avrocodec.null_codec(), bytes.zeros(16))
 //                 Ok(w) =>
-//                     match avrofile.append(w, avrovalue.long_value(1))
+//                     match avrofile.append(w, AvroIntValue(1))
 //                         Ok(_)  => println("appended")
 //                         Err(e) => println(e.message())
 //                 Err(e) => println(e.message())
 //         Err(e) => println(e.message())
 // ```
 pub fn append(w: AvroWriter, v: AvroValue) -> Result<AvroAppended, AvroFault> []
-    todo("avro-nv.avrofile.append")
+    avrovalue.check(v, w.schema)!
+    let buffered = list.concat(w.buffered, [v])
+    if list.len(buffered) < w.block_records
+        let next = AvroWriter { schema: w.schema, codec: w.codec, sync: w.sync,
+                                block_records: w.block_records, buffered: buffered, blocks: w.blocks }
+        return Ok(AvroAppended { writer: next, block: bytes.zeros(0) })
+    let out = block_of(w, buffered)!
+    let next = AvroWriter { schema: w.schema, codec: w.codec, sync: w.sync,
+                            block_records: w.block_records, buffered: [], blocks: w.blocks + 1 }
+    Ok(AvroAppended { writer: next, block: out })
+
+// The bytes of one `long`.
+fn long_of(n: Int) -> Bytes
+    var b = bytes.zeros(avrobinary.long_bytes(n))
+    avrobinary.put_long(n, b, 0)
+    b
+
+// One block of records: count, size, compressed records, sync marker.
+fn block_of(w: AvroWriter, records: [AvroValue]) -> Result<Bytes, AvroFault>
+    var parts: [Bytes] = []
+    for v in records
+        list.push(parts, avrobinary.encode(v, w.schema)!)
+    let data = bytes.concat(parts)
+    let packed = avrocodec.compress(w.codec, data, 0, bytes.len(data))!
+    Ok(long_of(list.len(records)) + long_of(bytes.len(packed)) + packed + w.sync)
 
 // What one append produced: the writer after it and any block it
 // completed.
@@ -547,7 +710,7 @@ pub fn append(w: AvroWriter, v: AvroValue) -> Result<AvroAppended, AvroFault> []
 //         Ok(s) =>
 //             match avrofile.writer(s, avrocodec.null_codec(), bytes.zeros(16))
 //                 Ok(w) =>
-//                     match avrofile.append(w, avrovalue.long_value(1))
+//                     match avrofile.append(w, AvroIntValue(1))
 //                         Ok(a)  => println("${bytes.len(a.block)}")
 //                         Err(e) => println(e.message())
 //                 Err(e) => println(e.message())
@@ -576,12 +739,13 @@ pub struct AvroAppended
 //         Err(e) => println(e.message())
 // ```
 pub fn pending(w: AvroWriter) -> Int []
-    todo("avro-nv.avrofile.pending")
+    list.len(w.buffered)
 
-// Flush whatever is buffered as a final block.
+// The buffered records as a final block, or an empty buffer when none
+// are buffered.
 //
 // A container file has no trailer, so this is the whole of closing
-// one: the last block, and nothing after it.
+// one.
 //
 // ```novo
 // use std.bytes
@@ -601,4 +765,6 @@ pub fn pending(w: AvroWriter) -> Int []
 //         Err(e) => println(e.message())
 // ```
 pub fn flush(w: AvroWriter) -> Result<Bytes, AvroFault> []
-    todo("avro-nv.avrofile.flush")
+    if list.len(w.buffered) == 0
+        return Ok(bytes.zeros(0))
+    block_of(w, w.buffered)

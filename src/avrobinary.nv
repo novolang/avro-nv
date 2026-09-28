@@ -1,61 +1,49 @@
 // avrobinary.nv — the binary encoding: zigzag varints, blocks, and
-// nothing else at all.
+// nothing else.
 //
-// Every body is a `todo()`.  The signatures are the design, and the
-// compiler checks them as claims; see the README for the stamp.
+// The encoding has no markers in it (specification section "Binary
+// Encoding").  A record is its fields' encodings concatenated, with no
+// field tag, no length, no terminator and no padding.  That is why
+// Avro is small, and why a decoder reading with the wrong schema does
+// not fail but produces wrong values.
 //
-// THE ENCODING HAS NO MARKERS IN IT.  A record is its fields'
-// encodings concatenated: no field tag, no length, no terminator, no
-// padding.  That is why Avro is small, and it is why a decoder reading
-// with the wrong schema does not fail but produces WRONG VALUES — it
-// has nothing to notice the mismatch with.  Everything else in this
-// package is arranged around that one fact.
+// These rules are the whole format.
 //
-// FOUR RULES ARE THE WHOLE FORMAT.
-//
-//   int, long    zigzag, then a seven-bits-per-byte varint.  Zigzag
-//                first, so that -1 is one byte rather than ten.
-//   float,       four and eight bytes, LITTLE-endian IEEE 754.  The
-//   double       only endianness decision in the format, and the
-//                opposite of what a reader who assumed network order
-//                would write.
+//   int, long    zigzag, then seven bits per byte, low group first.
+//                Zigzag comes first, so that -1 is one byte and not
+//                ten.
+//   float,       four and eight bytes, little-endian IEEE 754.
+//   double
 //   bytes,       a long length, then that many bytes.
 //   string
-//   arrays,      a long count, then that many items, repeated, ending
-//   maps         with a count of zero.  A NEGATIVE count means the
-//                absolute value of items follow AND a long byte-size
-//                comes first — which is what makes a large array
-//                skippable without decoding it.
+//   array, map   a long count, then that many items, repeated, and a
+//                count of zero at the end.  A negative count means its
+//                absolute value of items follow, and a long byte size
+//                comes before them, so a reader can step over the
+//                block.  A map item is a string key and then a value.
+//   union        a long branch index, then that branch.
+//   enum         a long symbol index.
+//   fixed        its bytes, with no length.
+//   null         zero bytes.
 //
-// A UNION IS A LONG BRANCH INDEX AND THEN THAT BRANCH.  An enum is a
-// long symbol index.  A fixed is its bytes with no prefix.  Null is
-// zero bytes.  There is nothing else.
+// A length is a varint, so five bytes of input can declare a string of
+// two gigabytes.  `AvroLimits` is the bound a caller sets once and
+// every decode takes.
 //
-// THE LENGTH LIMIT IS THE ONLY PROTECTION A CALLER HAS.  A `bytes`
-// length is a varint, so five bytes of input can declare a
-// two-gigabyte string.  `AvroLimits` is a value a caller sets once and
-// every decode takes, rather than a bound each entry point invents.
-//
-// AND EVERY DECODE WRITES INTO THE CALLER'S CURSOR.  `AvroCursor` is a
-// `@value` struct carrying the offset and a flag; the decoders take it
-// and answer the next one, so reading a record is a walk and not a
-// stack of allocations.
+// `AvroCursor` is a `@value` struct carrying an offset and a fault
+// code.  The low-level reads take one and answer the next, so reading
+// a long allocates nothing.  A `@value` struct cannot be the payload
+// of a `Result`, which is why the cursor carries a flag; `fault_of`
+// turns the flag into a fault.
 
+use std.bytes
 use avroerror
 use avrovalue
 use avroschema
 
 // A position in a buffer being decoded.
 //
-// A `@value` struct: a decode of a million-record block carries it in
-// registers.  `ok` goes false at the first fault and the offset then
-// names where.
-//
-// `ok` is a flag rather than a `Result` for the reason every `@value`
-// struct in this registry answers one: a `@value` struct cannot be a
-// `Result` payload in v1, and a cursor that boxed itself would
-// allocate once per FIELD of every record.  `fault_of` turns the flag
-// into the fault the rest of the package speaks.
+// `ok` goes false at the first fault, and `at` then names where.
 pub @value
 struct AvroCursor
     // The byte offset reached.
@@ -69,20 +57,23 @@ struct AvroCursor
 // The cursor fault code for a clean cursor: 0.
 pub const AVRO_CURSOR_OK = 0
 
-// The cursor fault code for input that ended mid-value.
+// The cursor fault code for input that ended in the middle of a value.
 pub const AVRO_CURSOR_TRUNCATED = 1
 
-// The cursor fault code for a varint that did not terminate in ten
+// The cursor fault code for a varint that did not end within ten
 // bytes, or encoded more than 64 bits.
 pub const AVRO_CURSOR_BAD_VARINT = 2
 
-// The cursor fault code for a negative length on a string, bytes or
-// fixed.
+// The cursor fault code for a negative length or count.
 pub const AVRO_CURSOR_NEGATIVE_LENGTH = 3
 
-// The cursor fault code for a length or count above the caller's
-// limit.
+// The cursor fault code for a length, count or depth above the
+// caller's limit.
 pub const AVRO_CURSOR_LIMIT = 4
+
+// The cursor fault code for a union branch or enum symbol index
+// outside its schema.
+pub const AVRO_CURSOR_BAD_INDEX = 5
 
 // A cursor at an offset, clean.
 //
@@ -93,9 +84,18 @@ pub const AVRO_CURSOR_LIMIT = 4
 //     println("${avrobinary.cursor(0).at}")
 // ```
 pub fn cursor(at: Int) -> AvroCursor []
-    todo("avro-nv.avrobinary.cursor")
+    AvroCursor { at: at, fault: AVRO_CURSOR_OK, ok: true }
+
+// A failed cursor at an offset.
+fn failed(at: Int, code: Int) -> AvroCursor
+    AvroCursor { at: at, fault: code, ok: false }
 
 // The fault a cursor's code means, or `None` for a clean one.
+//
+// The fault is placed at `block` and the cursor's offset.  A cursor
+// carries the kind of fault and not the numbers behind it, so a length
+// or an index the fault would name is `-1`; `decode` answers the full
+// fault.
 //
 // ```novo
 // use avrobinary
@@ -106,17 +106,25 @@ pub fn cursor(at: Int) -> AvroCursor []
 //         None    => println("the cursor is clean")
 // ```
 pub fn fault_of(c: AvroCursor, block: Int) -> ?AvroFault []
-    todo("avro-nv.avrobinary.fault_of")
+    if c.ok
+        return None
+    let at = avroerror.at_offset(block, c.at)
+    var kind = AvroTruncated
+    if c.fault == AVRO_CURSOR_BAD_VARINT
+        kind = AvroBadVarint
+    else if c.fault == AVRO_CURSOR_NEGATIVE_LENGTH
+        kind = AvroNegativeLength(-1)
+    else if c.fault == AVRO_CURSOR_LIMIT
+        kind = AvroLengthLimitReached(-1, -1)
+    else if c.fault == AVRO_CURSOR_BAD_INDEX
+        kind = AvroBadUnionIndex(-1, -1)
+    Some(avroerror.fault(kind, at))
 
 // The bounds a decode is held to.
 //
-// `avroerror.is_limit` is what separates a bound reached here from a
-// damaged file: neither says the bytes are wrong.
-//
-// A value a caller builds once and names, rather than a bound each
-// entry point invents.  THE ONLY PROTECTION AGAINST A HOSTILE LENGTH:
-// a `bytes` length is a varint, so five bytes of input can declare two
-// gigabytes.
+// A bound reached is `AvroLengthLimitReached`, which
+// `avroerror.is_limit` answers true for and `avroerror.is_corrupt`
+// false: the bytes may be fine.
 //
 // ```novo
 // use avrobinary
@@ -126,21 +134,22 @@ pub fn fault_of(c: AvroCursor, block: Int) -> ?AvroFault []
 // ```
 pub struct AvroLimits
     // The largest `bytes`, `string` or `fixed` length a decode will
-    // accept, or `-1` for unbounded.
+    // accept, or `-1` for no bound.
     max_length: Int
     // The largest number of items one array or map block may declare,
-    // or `-1`.
+    // or `-1` for no bound.
     max_items: Int
-    // How deep a schema may nest before a decode refuses, which stops
-    // a schema built to recurse from exhausting the stack.
+    // How deeply a schema may nest before a decode refuses, which stops
+    // a recursive schema and a hostile input from exhausting the
+    // stack.  `-1` for no bound.
     max_depth: Int
 
-// The bounds a caller gets when it says nothing: 64 MiB, 16 million
-// items, 64 levels.
+// The bounds a caller gets when it says nothing: 64 MiB per value, 16
+// million items per block, 64 levels of nesting.
 //
-// Bounded rather than unbounded by default, because unlike a
-// compressed stream an Avro datum carries no self-check at all and the
-// ordinary use of this package is reading somebody else's file.
+// They are bounded by default because an Avro datum carries no
+// self-check, and the ordinary use of this package is reading somebody
+// else's file.
 //
 // ```novo
 // use avrobinary
@@ -149,7 +158,7 @@ pub struct AvroLimits
 //     println("${avrobinary.default_limits().max_depth}")
 // ```
 pub fn default_limits() -> AvroLimits []
-    todo("avro-nv.avrobinary.default_limits")
+    AvroLimits { max_length: 67108864, max_items: 16777216, max_depth: 64 }
 
 // Bounds with no bound at all, for a caller decoding what it wrote.
 //
@@ -160,13 +169,12 @@ pub fn default_limits() -> AvroLimits []
 //     println("${avrobinary.no_limits().max_length}")
 // ```
 pub fn no_limits() -> AvroLimits []
-    todo("avro-nv.avrobinary.no_limits")
+    AvroLimits { max_length: -1, max_items: -1, max_depth: -1 }
 
 // Zigzag a signed integer: `(n << 1) ^ (n >> 63)`.
 //
-// Applied BEFORE the varint, so that a small negative number is one
-// byte rather than ten.  Published because it is the single most
-// copied three lines in any Avro port and the one a test should pin.
+// It is applied before the varint, so that a small negative number is
+// one byte and not ten.
 //
 // ```novo
 // use avrobinary
@@ -175,7 +183,7 @@ pub fn no_limits() -> AvroLimits []
 //     println("${avrobinary.zigzag(-1)}")
 // ```
 pub fn zigzag(n: Int) -> Int []
-    todo("avro-nv.avrobinary.zigzag")
+    (n << 1) ^ bits.asr(n, 63)
 
 // Undo zigzag: `(n >>> 1) ^ -(n & 1)`.
 //
@@ -186,12 +194,9 @@ pub fn zigzag(n: Int) -> Int []
 //     println("${avrobinary.unzigzag(1)}")
 // ```
 pub fn unzigzag(n: Int) -> Int []
-    todo("avro-nv.avrobinary.unzigzag")
+    bits.shr(n, 1) ^ (0 - (n & 1))
 
-// How many bytes the encoding of a `long` occupies, `1` ..= `10`.
-//
-// What a writer sizes a buffer with, and what a reader uses to step
-// over a value it does not want.
+// How many bytes the encoding of a `long` occupies, 1 to 10.
 //
 // ```novo
 // use avrobinary
@@ -200,12 +205,14 @@ pub fn unzigzag(n: Int) -> Int []
 //     println("${avrobinary.long_bytes(-1)}")
 // ```
 pub fn long_bytes(n: Int) -> Int []
-    todo("avro-nv.avrobinary.long_bytes")
+    var z = bits.shr(zigzag(n), 7)
+    var count = 1
+    while z != 0
+        z = bits.shr(z, 7)
+        count += 1
+    count
 
 // One decoded `long`: the value and the cursor after it.
-//
-// A `@value` struct, for the same reason `AvroCursor` is: a record of
-// twenty fields is twenty of these.
 pub @value
 struct AvroLongRead
     // The value, or 0 when the cursor is not `ok`.
@@ -215,8 +222,8 @@ struct AvroLongRead
 
 // Read a zigzag varint `long` at the cursor.
 //
-// THE FUNCTION EVERY OTHER READ IS BUILT ON: a length, a branch index,
-// a symbol index and a block count are all this.
+// A length, a branch index, a symbol index and a block count are all
+// read with it.  A cursor that is not `ok` is answered unchanged.
 //
 // ```novo
 // use std.bytes
@@ -227,7 +234,19 @@ struct AvroLongRead
 //     println("${r.value}")
 // ```
 pub fn read_long(src: Bytes, c: AvroCursor) -> AvroLongRead []
-    todo("avro-nv.avrobinary.read_long")
+    if not c.ok
+        return AvroLongRead { value: 0, cursor: c }
+    var z = 0
+    for i in 0..10
+        let b = bytes.byte_at(src, c.at + i) ?? -1
+        if b < 0
+            return AvroLongRead { value: 0, cursor: failed(c.at + i, AVRO_CURSOR_TRUNCATED) }
+        if i == 9 and b > 1
+            break
+        z = z | ((b & 0x7F) << (7 * i))
+        if b < 0x80
+            return AvroLongRead { value: unzigzag(z), cursor: cursor(c.at + i + 1) }
+    AvroLongRead { value: 0, cursor: failed(c.at, AVRO_CURSOR_BAD_VARINT) }
 
 // Write a `long` into a caller's buffer at `at`, answering how many
 // bytes it took.
@@ -243,130 +262,31 @@ pub fn read_long(src: Bytes, c: AvroCursor) -> AvroLongRead []
 //         Ok(n)  => println("${n}")
 //         Err(e) => println(e.message())
 // ```
-pub fn write_long(n: Int, dst: Bytes, at: Int) -> Result<Int, AvroFault> []
-    todo("avro-nv.avrobinary.write_long")
+pub fn write_long(n: Int, var dst: Bytes, at: Int) -> Result<Int, AvroFault> []
+    let need = long_bytes(n)
+    let room = bytes.len(dst) - at
+    if at < 0 or room < need
+        return Err(avroerror.fault(AvroBufferTooSmall(need, math.max(room, 0)),
+                                   avroerror.at_offset(-1, at)))
+    put_long(n, dst, at)
+    Ok(need)
 
-// Skip one value of a schema, without building it.
-//
-// Answers the cursor past it.  What a reader does with a field its own
-// schema does not have, and what makes reading three fields out of a
-// forty-field record cost three fields' work plus thirty-seven skips.
-//
-// A `fixed`, an `int` and a `double` skip in constant time; a record
-// skips field by field, because there is no length to jump.
-//
-// ```novo
-// use std.bytes
-// use avrobinary
-// use avroschema
-//
-// fn main() [io]
-//     match avroschema.parse("\"long\"")
-//         Ok(s) =>
-//             let c = avrobinary.skip(bytes.zeros(4), avrobinary.cursor(0), s,
-//                                     avrobinary.default_limits())
-//             println("${c.at}")
-//         Err(e) => println(e.message())
-// ```
-pub fn skip(src: Bytes, c: AvroCursor, s: AvroSchema, limits: AvroLimits) -> AvroCursor []
-    todo("avro-nv.avrobinary.skip")
-
-// Decode one datum of a schema from `src` at `off`.
-//
-// The whole-value entry point: the cursor walk above is what it is
-// made of, and this is what a caller who wants a value calls.
-//
-// ```novo
-// use std.bytes
-// use avrobinary
-// use avroschema
-//
-// fn main() [io]
-//     match avroschema.parse("\"long\"")
-//         Ok(s) =>
-//             match avrobinary.decode(bytes.zeros(1), 0, s,
-//                                     avrobinary.default_limits())
-//                 Ok(v)  => println(avrovalue.kind_name(v))
-//                 Err(e) => println(e.message())
-//         Err(e) => println(e.message())
-// ```
-pub fn decode(src: Bytes, off: Int, s: AvroSchema,
-              limits: AvroLimits) -> Result<AvroValue, AvroFault> []
-    todo("avro-nv.avrobinary.decode")
-
-// Encode one datum of a schema, allocating the output.
-//
-// `AvroBadSchemaShape` when the value does not fit the schema, which
-// `avrovalue.check` is the separate call for.
-//
-// ```novo
-// use std.bytes
-// use avrobinary
-// use avroschema
-// use avrovalue
-//
-// fn main() [io]
-//     match avroschema.parse("\"long\"")
-//         Ok(s) =>
-//             match avrobinary.encode(avrovalue.long_value(7), s)
-//                 Ok(b)  => println("${bytes.len(b)}")
-//                 Err(e) => println(e.message())
-//         Err(e) => println(e.message())
-// ```
-pub fn encode(v: AvroValue, s: AvroSchema) -> Result<Bytes, AvroFault> []
-    todo("avro-nv.avrobinary.encode")
-
-// Encode one datum into a caller's buffer at `at`, answering how many
-// bytes it took.
-//
-// The allocation-free form, for a writer assembling a block into a
-// buffer it already sized from `encoded_bytes`.
-//
-// ```novo
-// use std.bytes
-// use avrobinary
-// use avroschema
-// use avrovalue
-//
-// fn main() [io]
-//     match avroschema.parse("\"long\"")
-//         Ok(s) =>
-//             match avrobinary.encode_into(avrovalue.long_value(7), s,
-//                                          bytes.zeros(16), 0)
-//                 Ok(n)  => println("${n}")
-//                 Err(e) => println(e.message())
-//         Err(e) => println(e.message())
-// ```
-pub fn encode_into(v: AvroValue, s: AvroSchema, dst: Bytes, at: Int) -> Result<Int, AvroFault> []
-    todo("avro-nv.avrobinary.encode_into")
-
-// How many bytes a datum will encode to.
-//
-// Answered without writing anything, so a caller sizes one buffer for
-// a whole block rather than growing one per record.
-//
-// ```novo
-// use avrobinary
-// use avroschema
-// use avrovalue
-//
-// fn main() [io]
-//     match avroschema.parse("\"long\"")
-//         Ok(s) =>
-//             match avrobinary.encoded_bytes(avrovalue.long_value(7), s)
-//                 Ok(n)  => println("${n}")
-//                 Err(e) => println(e.message())
-//         Err(e) => println(e.message())
-// ```
-pub fn encoded_bytes(v: AvroValue, s: AvroSchema) -> Result<Int, AvroFault> []
-    todo("avro-nv.avrobinary.encoded_bytes")
+// Write a `long` that is known to fit, answering the offset after it.
+fn put_long(n: Int, var dst: Bytes, at: Int) -> Int
+    var z = zigzag(n)
+    var i = at
+    while bits.shr(z, 7) != 0
+        bytes.set_u8(dst, i, (z & 0x7F) | 0x80)
+        z = bits.shr(z, 7)
+        i += 1
+    bytes.set_u8(dst, i, z)
+    i + 1
 
 // The count and the byte size an array or map block header declares.
 //
-// A NEGATIVE count means the absolute value of items follow AND a byte
-// size comes next — which is what makes a large array skippable
-// without decoding it, and the part of the format a port forgets until
-// it meets a file that uses it.
+// A negative count on the wire means the absolute value of items
+// follow and a byte size comes next, which lets a reader step over a
+// large block without decoding it.
 //
 // ```novo
 // use std.bytes
@@ -378,8 +298,8 @@ pub fn encoded_bytes(v: AvroValue, s: AvroSchema) -> Result<Int, AvroFault> []
 // ```
 pub @value
 struct AvroBlockCount
-    // How many items follow, always non-negative here: the sign is
-    // consumed by this function and turned into `byte_size`.
+    // How many items follow, never negative: the sign is consumed by
+    // `read_block_header` and turned into `byte_size`.
     count: Int
     // The block's byte size where the writer declared one, or `-1`.
     byte_size: Int
@@ -397,4 +317,449 @@ struct AvroBlockCount
 //                                             avrobinary.cursor(0)).count}")
 // ```
 pub fn read_block_header(src: Bytes, c: AvroCursor) -> AvroBlockCount []
-    todo("avro-nv.avrobinary.read_block_header")
+    let r = read_long(src, c)
+    if r.value >= 0
+        return AvroBlockCount { count: r.value, byte_size: -1, cursor: r.cursor }
+    let size = read_long(src, r.cursor)
+    AvroBlockCount { count: 0 - r.value, byte_size: size.value, cursor: size.cursor }
+
+// The result of one step of a decode or a skip: the value, where the
+// input continues, and the fault that stopped it, if one did.
+struct Dec
+    value: AvroValue
+    at: Int
+    fault: ?AvroFault
+
+// A step that stopped with a fault.
+fn stop(kind: AvroFaultKind, path: Str, at: Int) -> Dec
+    Dec { value: AvroNullValue,
+        at: at,
+        fault: Some(avroerror.fault(kind, avroerror.at_both(path, -1, at))) }
+
+// A step that read a value.
+fn got(v: AvroValue, at: Int) -> Dec
+    Dec { value: v, at: at, fault: None }
+
+// The fault a failed cursor stands for, as a step.
+fn from_cursor(c: AvroCursor, path: Str) -> Dec
+    if c.fault == AVRO_CURSOR_BAD_VARINT
+        return stop(AvroBadVarint, path, c.at)
+    stop(AvroTruncated, path, c.at)
+
+// Whether a count is above a bound, where `-1` is no bound.
+fn over(n: Int, bound: Int) -> Bool
+    bound >= 0 and n > bound
+
+// The context of one decode: the named types references are looked up
+// in, the input, the bounds, and whether values are built or only
+// stepped over.
+struct Walk
+    defs: [AvroSchema]
+    src: Bytes
+    limits: AvroLimits
+    build: Bool
+
+// One datum of a schema at `at`.
+fn walk(w: Walk, s0: AvroSchema, at: Int, depth: Int, path: Str) -> Dec
+    let s = avroschema.deref(w.defs, s0)
+    if s.is_reference
+        return stop(AvroUnknownType(s.full_name), path, at)
+    if over(depth, w.limits.max_depth)
+        return stop(AvroLengthLimitReached(depth, w.limits.max_depth), path, at)
+    let n = bytes.len(w.src)
+    match s.kind
+        AvroNull    => got(AvroNullValue, at)
+        AvroBoolean =>
+            let b = bytes.byte_at(w.src, at) ?? -1
+            if b < 0
+                return stop(AvroTruncated, path, at)
+            got(AvroBoolValue(b != 0), at + 1)
+        AvroInt     => walk_long(w, at, path, true)
+        AvroLong    => walk_long(w, at, path, false)
+        AvroFloat   =>
+            if at + 4 > n
+                return stop(AvroTruncated, path, at)
+            got(AvroFloatValue(f32_from_bits(bytes.u32_le_at(w.src, at) ?? 0)), at + 4)
+        AvroDouble  =>
+            if at + 8 > n
+                return stop(AvroTruncated, path, at)
+            got(AvroDoubleValue(float.from_bits(bytes.u64_le_at(w.src, at) ?? 0)), at + 8)
+        AvroBytes   => walk_bytes(w, at, path, AvroBytes)
+        AvroString  => walk_bytes(w, at, path, AvroString)
+        AvroFixed   =>
+            if over(s.fixed_size, w.limits.max_length)
+                return stop(AvroLengthLimitReached(s.fixed_size, w.limits.max_length), path, at)
+            if at + s.fixed_size > n
+                return stop(AvroTruncated, path, at)
+            if not w.build
+                return got(AvroNullValue, at + s.fixed_size)
+            got(AvroFixedValue(bytes.slice(w.src, at, at + s.fixed_size)), at + s.fixed_size)
+        AvroEnum    =>
+            let r = read_long(w.src, cursor(at))
+            if not r.cursor.ok
+                return from_cursor(r.cursor, path)
+            if r.value < 0 or r.value >= list.len(s.symbols)
+                return stop(AvroBadEnumIndex(r.value, list.len(s.symbols)), path, at)
+            got(AvroEnumValue(r.value), r.cursor.at)
+        AvroUnion   =>
+            let r = read_long(w.src, cursor(at))
+            if not r.cursor.ok
+                return from_cursor(r.cursor, path)
+            if r.value < 0 or r.value >= list.len(s.branches)
+                return stop(AvroBadUnionIndex(r.value, list.len(s.branches)), path, at)
+            let inner = walk(w, s.branches[r.value], r.cursor.at, depth + 1, path)
+            if inner.fault != None
+                return inner
+            got(AvroUnionValue(r.value, [inner.value]), inner.at)
+        AvroRecord  =>
+            var fields: [AvroValue] = []
+            var i = at
+            for f in s.fields
+                let d = walk(w, f.schema, i, depth + 1, path + "." + f.name)
+                if d.fault != None
+                    return d
+                if w.build
+                    list.push(fields, d.value)
+                i = d.at
+            got(AvroRecordValue(fields), i)
+        AvroArray   => walk_blocks(w, s, at, depth, path, false)
+        AvroMap     => walk_blocks(w, s, at, depth, path, true)
+
+// An `int` or a `long`.
+fn walk_long(w: Walk, at: Int, path: Str, is_int: Bool) -> Dec
+    let r = read_long(w.src, cursor(at))
+    if not r.cursor.ok
+        return from_cursor(r.cursor, path)
+    if is_int
+        if r.value < -2147483648 or r.value > 2147483647
+            return stop(AvroBadVarint, path, at)
+        return got(AvroIntValue(r.value), r.cursor.at)
+    got(AvroLongValue(r.value), r.cursor.at)
+
+// A length and then that many bytes, as `bytes` or `string`.
+fn walk_bytes(w: Walk, at: Int, path: Str, kind: AvroType) -> Dec
+    let r = read_long(w.src, cursor(at))
+    if not r.cursor.ok
+        return from_cursor(r.cursor, path)
+    let len = r.value
+    let from = r.cursor.at
+    if len < 0
+        return stop(AvroNegativeLength(len), path, at)
+    if over(len, w.limits.max_length)
+        return stop(AvroLengthLimitReached(len, w.limits.max_length), path, at)
+    if from + len > bytes.len(w.src)
+        return stop(AvroTruncated, path, from)
+    if not w.build
+        return got(AvroNullValue, from + len)
+    let data = bytes.slice(w.src, from, from + len)
+    match kind
+        AvroString => got(AvroStrValue(bytes.to_str(data)), from + len)
+        _          => got(AvroBytesValue(data), from + len)
+
+// The blocks of an array or a map, up to the block of count zero.
+fn walk_blocks(w: Walk, s: AvroSchema, at: Int, depth: Int, path: Str, is_map: Bool) -> Dec
+    var keys: [Str] = []
+    var items: [AvroValue] = []
+    var i = at
+    loop
+        let h = read_block_header(w.src, cursor(i))
+        if not h.cursor.ok
+            return from_cursor(h.cursor, path)
+        if h.count == 0
+            i = h.cursor.at
+            break
+        if over(h.count, w.limits.max_items)
+            return stop(AvroLengthLimitReached(h.count, w.limits.max_items), path, i)
+        if h.byte_size < -1
+            return stop(AvroNegativeLength(h.byte_size), path, i)
+        i = h.cursor.at
+        for k in 0..h.count
+            let here = "${path}[${list.len(items) + k}]"
+            if is_map
+                let key = walk_bytes(w, i, here, AvroString)
+                if key.fault != None
+                    return key
+                if let AvroStrValue(text) = key.value
+                    list.push(keys, text)
+                i = key.at
+            let d = walk(w, s.element[0], i, depth + 1, here)
+            if d.fault != None
+                return d
+            if w.build
+                list.push(items, d.value)
+            i = d.at
+    if is_map
+        return got(AvroMapValue(keys, items), i)
+    got(AvroArrayValue(items), i)
+
+// Skip one value of a schema, without building it.
+//
+// Answers the cursor past it, or a failed cursor at the fault.  A
+// reader skips a field its own schema does not have this way.  A
+// `fixed`, an `int` and a `double` skip in constant time; a record
+// skips field by field, because it carries no length.
+//
+// ```novo
+// use std.bytes
+// use avrobinary
+// use avroschema
+//
+// fn main() [io]
+//     match avroschema.parse("\"long\"")
+//         Ok(s) =>
+//             let c = avrobinary.skip(bytes.zeros(4), avrobinary.cursor(0), s,
+//                                     avrobinary.default_limits())
+//             println("${c.at}")
+//         Err(e) => println(e.message())
+// ```
+pub fn skip(src: Bytes, c: AvroCursor, s: AvroSchema, limits: AvroLimits) -> AvroCursor []
+    if not c.ok
+        return c
+    let w = Walk { defs: avroschema.defs_of(s), src: src, limits: limits, build: false }
+    let d = walk(w, s, c.at, 0, "")
+    match d.fault
+        None    => cursor(d.at)
+        Some(f) => failed(f.at.offset, cursor_code(f.kind))
+
+// The cursor code a fault kind has.
+fn cursor_code(k: AvroFaultKind) -> Int
+    match k
+        AvroBadVarint                => AVRO_CURSOR_BAD_VARINT
+        AvroNegativeLength(_)        => AVRO_CURSOR_NEGATIVE_LENGTH
+        AvroLengthLimitReached(_, _) => AVRO_CURSOR_LIMIT
+        AvroBadUnionIndex(_, _)      => AVRO_CURSOR_BAD_INDEX
+        AvroBadEnumIndex(_, _)       => AVRO_CURSOR_BAD_INDEX
+        _                            => AVRO_CURSOR_TRUNCATED
+
+// Decode one datum of a schema from `src` at `off`.
+//
+// Faults are placed at the schema path and the byte offset where they
+// were found.
+//
+// ```novo
+// use std.bytes
+// use avrobinary
+// use avroschema
+// use avrovalue
+//
+// fn main() [io]
+//     match avroschema.parse("\"long\"")
+//         Ok(s) =>
+//             match avrobinary.decode(bytes.zeros(1), 0, s,
+//                                     avrobinary.default_limits())
+//                 Ok(v)  => println(avrovalue.kind_name(v))
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn decode(src: Bytes, off: Int, s: AvroSchema,
+              limits: AvroLimits) -> Result<AvroValue, AvroFault> []
+    let w = Walk { defs: avroschema.defs_of(s), src: src, limits: limits, build: true }
+    let d = walk(w, s, off, 0, s.full_name)
+    match d.fault
+        None    => Ok(d.value)
+        Some(f) => Err(f)
+
+// Decode one datum and say where it ended, for a caller reading
+// several in a row.
+fn decode_at(defs: [AvroSchema], src: Bytes, off: Int, s: AvroSchema, limits: AvroLimits) -> Dec
+    let w = Walk { defs: defs, src: src, limits: limits, build: true }
+    walk(w, s, off, 0, s.full_name)
+
+// The 32-bit IEEE 754 pattern of a float, rounded to nearest-even.
+fn f32_bits(x: Float) -> Int
+    let r: fp32 = x
+    let wide: Float = r
+    let d = float.to_bits(wide)
+    let sign = bits.shr(d, 63) << 31
+    let e = bits.shr(d, 52) & 0x7FF
+    let m = d & 0xFFFFFFFFFFFFF
+    if e == 0x7FF
+        // Widened from 32 bits, a NaN keeps its payload in the top 23
+        // bits of the mantissa, so the shift keeps it non-zero.
+        return sign | 0x7F800000 | bits.shr(m, 29)
+    if e == 0
+        return sign
+    let e32 = e - 1023 + 127
+    if e32 >= 1
+        return sign | (e32 << 23) | bits.shr(m, 29)
+    sign | bits.shr(m | (1 << 52), 29 + 1 - e32)
+
+// The float a 32-bit IEEE 754 pattern holds.
+fn f32_from_bits(b: Int) -> Float
+    let sign = bits.shr(b, 31) & 1
+    let e = bits.shr(b, 23) & 0xFF
+    let m = b & 0x7FFFFF
+    if e == 0xFF
+        return float.from_bits((sign << 63) | (0x7FF << 52) | (m << 29))
+    if e == 0
+        let x = m as Float * 1.401298464324817e-45
+        return float.from_bits(float.to_bits(x) | (sign << 63))
+    float.from_bits((sign << 63) | ((e - 127 + 1023) << 52) | (m << 29))
+
+// Encode one datum of a schema, allocating the output.
+//
+// `AvroBadSchemaShape` when the value does not fit the schema; see
+// `avrovalue.check`.
+//
+// ```novo
+// use std.bytes
+// use avrobinary
+// use avroschema
+// use avrovalue
+//
+// fn main() [io]
+//     match avroschema.parse("\"long\"")
+//         Ok(s) =>
+//             match avrobinary.encode(avrovalue.long_value(7), s)
+//                 Ok(b)  => println("${bytes.len(b)}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn encode(v: AvroValue, s: AvroSchema) -> Result<Bytes, AvroFault> []
+    let n = encoded_bytes(v, s)!
+    var out = bytes.zeros(n)
+    put(avroschema.defs_of(s), v, s, out, 0)
+    Ok(out)
+
+// Encode one datum into a caller's buffer at `at`, answering how many
+// bytes it took.
+//
+// `AvroBufferTooSmall` when the datum does not fit, and nothing is
+// written then.  A writer assembling a block sizes one buffer from
+// `encoded_bytes` and encodes every record into it.
+//
+// ```novo
+// use std.bytes
+// use avrobinary
+// use avroschema
+// use avrovalue
+//
+// fn main() [io]
+//     match avroschema.parse("\"long\"")
+//         Ok(s) =>
+//             match avrobinary.encode_into(avrovalue.long_value(7), s,
+//                                          bytes.zeros(16), 0)
+//                 Ok(n)  => println("${n}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn encode_into(v: AvroValue, s: AvroSchema, var dst: Bytes,
+                   at: Int) -> Result<Int, AvroFault> []
+    let n = encoded_bytes(v, s)!
+    let room = bytes.len(dst) - at
+    if at < 0 or room < n
+        return Err(avroerror.fault(AvroBufferTooSmall(n, math.max(room, 0)),
+                                   avroerror.at_offset(-1, at)))
+    put(avroschema.defs_of(s), v, s, dst, at)
+    Ok(n)
+
+// How many bytes a datum will encode to.
+//
+// It writes nothing, so a caller can size one buffer for a whole block.
+// `AvroBadSchemaShape` when the value does not fit the schema.
+//
+// ```novo
+// use avrobinary
+// use avroschema
+// use avrovalue
+//
+// fn main() [io]
+//     match avroschema.parse("\"long\"")
+//         Ok(s) =>
+//             match avrobinary.encoded_bytes(avrovalue.long_value(7), s)
+//                 Ok(n)  => println("${n}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn encoded_bytes(v: AvroValue, s: AvroSchema) -> Result<Int, AvroFault> []
+    avrovalue.check(v, s)!
+    Ok(size_of(avroschema.defs_of(s), v, s))
+
+// The encoded size of a value already checked against its schema.
+fn size_of(defs: [AvroSchema], v: AvroValue, s0: AvroSchema) -> Int
+    let s = avroschema.deref(defs, s0)
+    match v
+        AvroNullValue              => 0
+        AvroBoolValue(_)           => 1
+        AvroIntValue(n)            => long_bytes(n)
+        AvroLongValue(n)           => long_bytes(n)
+        AvroFloatValue(_)          => 4
+        AvroDoubleValue(_)         => 8
+        AvroBytesValue(b)          => long_bytes(bytes.len(b)) + bytes.len(b)
+        AvroStrValue(t)            => long_bytes(str.len(t)) + str.len(t)
+        AvroFixedValue(b)          => bytes.len(b)
+        AvroEnumValue(i)           => long_bytes(i)
+        AvroUnionValue(b, inner)   => long_bytes(b) + size_of(defs, inner[0], s.branches[b])
+        AvroRecordValue(fields)    =>
+            var n = 0
+            for i in 0..list.len(fields)
+                n += size_of(defs, fields[i], s.fields[i].schema)
+            n
+        AvroArrayValue(items)      =>
+            var n = 1
+            if list.len(items) > 0
+                n += long_bytes(list.len(items))
+            for item in items
+                n += size_of(defs, item, s.element[0])
+            n
+        AvroMapValue(keys, values) =>
+            var n = 1
+            if list.len(keys) > 0
+                n += long_bytes(list.len(keys))
+            for i in 0..list.len(keys)
+                n += long_bytes(str.len(keys[i])) + str.len(keys[i]) + size_of(defs, values[i], s.element[0])
+            n
+
+// Write a string's bytes at `at`, answering the offset after them.
+fn put_str(t: Str, var dst: Bytes, at: Int) -> Int
+    let i = put_long(str.len(t), dst, at)
+    bytes.copy_into(dst, i, bytes.from_str(t), 0, str.len(t))
+    i + str.len(t)
+
+// Write a value already checked against its schema, answering the
+// offset after it.  Arrays and maps are written as one block.
+fn put(defs: [AvroSchema], v: AvroValue, s0: AvroSchema, var dst: Bytes, at: Int) -> Int
+    let s = avroschema.deref(defs, s0)
+    match v
+        AvroNullValue              => at
+        AvroBoolValue(b)           =>
+            bytes.set_u8(dst, at, (if b then 1 else 0))
+            at + 1
+        AvroIntValue(n)            => put_long(n, dst, at)
+        AvroLongValue(n)           => put_long(n, dst, at)
+        AvroFloatValue(x)          =>
+            bytes.set_u32_le(dst, at, f32_bits(x))
+            at + 4
+        AvroDoubleValue(x)         =>
+            bytes.set_u64_le(dst, at, float.to_bits(x))
+            at + 8
+        AvroBytesValue(b)          =>
+            let i = put_long(bytes.len(b), dst, at)
+            bytes.copy_into(dst, i, b, 0, bytes.len(b))
+            i + bytes.len(b)
+        AvroStrValue(t)            => put_str(t, dst, at)
+        AvroFixedValue(b)          =>
+            bytes.copy_into(dst, at, b, 0, bytes.len(b))
+            at + bytes.len(b)
+        AvroEnumValue(i)           => put_long(i, dst, at)
+        AvroUnionValue(b, inner)   => put(defs, inner[0], s.branches[b], dst, put_long(b, dst, at))
+        AvroRecordValue(fields)    =>
+            var i = at
+            for k in 0..list.len(fields)
+                i = put(defs, fields[k], s.fields[k].schema, dst, i)
+            i
+        AvroArrayValue(items)      =>
+            var i = at
+            if list.len(items) > 0
+                i = put_long(list.len(items), dst, i)
+            for item in items
+                i = put(defs, item, s.element[0], dst, i)
+            put_long(0, dst, i)
+        AvroMapValue(keys, values) =>
+            var i = at
+            if list.len(keys) > 0
+                i = put_long(list.len(keys), dst, i)
+            for k in 0..list.len(keys)
+                i = put_str(keys[k], dst, i)
+                i = put(defs, values[k], s.element[0], dst, i)
+            put_long(0, dst, i)

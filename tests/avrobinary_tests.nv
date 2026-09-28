@@ -1,8 +1,5 @@
 // avrobinary_tests.nv — zigzag varints, blocks, the value type, and
 // the bounds a decode is held to.
-//
-// RED ON PURPOSE: every assertion reaches `not implemented:
-// avro-nv.<module>.<fn>`.
 
 use std.test
 use std.bytes
@@ -128,7 +125,7 @@ fn test_a_value_remembers_what_the_schema_distinguishes() [io]
     test.assert(avrovalue.kind_name(avrovalue.str_value("x")) == "string")
     test.assert(avrovalue.kind_name(AvroBytesValue(bytes.zeros(1))) == "bytes")
 
-    test.case("an enum is an INDEX, because the index is the encoding")
+    test.case("an enum is an index, because the index is the encoding")
     test.assert(avrovalue.kind_name(AvroEnumValue(2)) == "enum")
 
     test.case("and a union remembers which branch it came from")

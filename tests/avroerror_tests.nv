@@ -1,0 +1,83 @@
+// avroerror_tests.nv — every fault kind: its stable name, its sentence,
+// and which of the five questions it answers yes to.
+
+use std.test
+use avroerror
+
+// Each kind, its name, the start of its sentence, and its answers to
+// is_corrupt, is_incomplete, is_schema_error, is_unsupported and
+// is_limit, written as five letters: c, i, s, u and l, or `-`.
+fn kinds() -> [(AvroFaultKind, Str, Str, Str)]
+    [(AvroSchemaNotJson("x"), "schema-not-json", "the schema is not JSON: x", "--s--"),
+     (AvroUnknownType("T"), "unknown-type", "`T` is not a type", "--s--"),
+     (AvroDuplicateName("a.T"), "duplicate-name", "`a.T` is defined twice", "--s--"),
+     (AvroBadName("9x"), "bad-name", "`9x` is not a legal Avro name", "--s--"),
+     (AvroBadSchemaShape("d"), "bad-schema-shape", "the schema is malformed: d", "--s--"),
+     (AvroBadDefault("f"), "bad-default", "the default of field `f`", "--s--"),
+     (AvroBadLogicalType("date"), "bad-logical-type", "the logical type `date`", "--s--"),
+     (AvroNoResolution("r"), "no-resolution", "the schemas do not resolve: r", "--s--"),
+     (AvroMissingFieldNoDefault("f"), "missing-field-no-default", "the reader's field `f`", "--s--"),
+     (AvroBadUnionIndex(5, 2), "bad-union-index", "union branch 5 is outside a union of 2", "c----"),
+     (AvroBadEnumIndex(9, 3), "bad-enum-index", "enum symbol 9 is outside an enum of 3", "c----"),
+     (AvroBadVarint, "bad-varint", "a variable-length integer", "c----"),
+     (AvroNegativeLength(-4), "negative-length", "a length of -4 is negative", "c----"),
+     (AvroLengthLimitReached(9, 8), "length-limit-reached", "9 is above the limit of 8", "----l"),
+     (AvroBadFileMagic, "bad-file-magic", "the input does not start with `Obj`", "c----"),
+     (AvroNoSchemaInFile, "no-schema-in-file", "the file's metadata has no", "c----"),
+     (AvroSyncMismatch(3), "sync-mismatch", "block 3 does not end", "c----"),
+     (AvroUnsupportedCodec("xz"), "unsupported-codec", "the codec `xz` was not supplied", "---u-"),
+     (AvroChecksumMismatch("snappy"),
+        "checksum-mismatch",
+        "a `snappy` block does not match",
+        "c----"),
+     (AvroBadSingleObjectMarker,
+        "bad-single-object-marker",
+        "the input does not start with the single",
+        "c----"),
+     (AvroUnknownFingerprint("00ff"),
+        "unknown-fingerprint",
+        "no schema offered has the fingerprint 00ff",
+        "---u-"),
+     (AvroTruncated, "truncated", "the input ends in the middle", "-i---"),
+     (AvroBufferTooSmall(8, 4),
+        "buffer-too-small",
+        "the buffer holds 4 bytes and 8 are needed",
+        "----l"),
+     (AvroBadParameter("p"), "bad-parameter", "a parameter is out of range: p", "-----"),
+     (AvroSourceFailed, "source-failed", "the source failed", "-----")]
+
+// A letter when a question answers yes, and `-` when it answers no.
+fn mark(yes: Bool, letter: Str) -> Str
+    if yes
+        return letter
+    "-"
+
+// The five answers of a kind, as `kinds` writes them.
+fn answers(k: AvroFaultKind) -> Str
+    mark(avroerror.is_corrupt(k), "c") + mark(avroerror.is_incomplete(k), "i")
+        + mark(avroerror.is_schema_error(k), "s") + mark(avroerror.is_unsupported(k), "u")
+        + mark(avroerror.is_limit(k), "l")
+
+@test
+fn test_every_kind_has_a_name_a_sentence_and_one_answer() [io]
+    for (k, name, sentence, want) in kinds()
+        test.case(name)
+        test.assert_eq_str(avroerror.kind_name(k), name)
+        let f = avroerror.fault(k, avroerror.at_offset(-1, -1))
+        test.assert(str.starts_with(avroerror.describe(f), sentence))
+        test.assert_eq_str(answers(k), want)
+
+@test
+fn test_a_sentence_names_the_path_the_block_and_the_offset() [io]
+    test.case("all three")
+    let f = avroerror.fault(AvroTruncated, avroerror.at_both("User.zip", 12, 480))
+    test.assert_eq_str(avroerror.describe(f),
+                       "the input ends in the middle of a value, at `User.zip`, in block 12, at byte 480")
+
+    test.case("the path alone")
+    let g = avroerror.fault(AvroUnknownType("Colour"), avroerror.at_path("User"))
+    test.assert_eq_str(g.message(), "`Colour` is not a type this schema defines, at `User`")
+
+    test.case("the offset alone")
+    let h = avroerror.fault(AvroBadVarint, avroerror.at_offset(-1, 3))
+    test.assert(str.ends_with(avroerror.describe(h), "longer than 64 bits, at byte 3"))

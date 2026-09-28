@@ -1,31 +1,31 @@
-// avrovalue.nv — the value an Avro datum decodes to, and the reason it
-// is one type rather than a generic JSON value.
+// avrovalue.nv — the value an Avro datum decodes to, its two JSON
+// encodings, and the specification's sort order.
 //
-// Every body is a `todo()`.  The signatures are the design, and the
-// compiler checks them as claims; see the README for the stamp.
+// A decoded Avro datum is not a JSON value.  `bytes` and `string` are
+// different types with the same encoding, `int` and `long` are
+// different widths, `float` and `double` are different precisions, an
+// `enum` is a symbol and not a string, a `fixed` is not a `bytes`, and
+// a union value remembers which branch it came from.  A JSON value
+// would lose all six, and writing it back would produce a different
+// file.  `AvroValue` keeps them.
 //
-// WHY THIS PACKAGE DECLARES ITS OWN VALUE TYPE.  A decoded Avro datum
-// is not JSON and does not fit a JSON value without losing things that
-// matter: `bytes` and `string` are different types with the same
-// encoding, `int` and `long` are different widths, `float` and `double`
-// are different precisions, an `enum` is a symbol and not a string, a
-// `fixed` is not a `bytes`, and a union value remembers WHICH BRANCH
-// it came from.  A decoder that answered a JSON value would throw all
-// six away, and a writer round-tripping through it would produce a
-// different file.
+// A union value carries its branch index beside the value, because a
+// union of `["null","string"]` and a union of `["string","null"]`
+// encode the same string differently.
 //
-// AND THE VALUE CARRIES ITS BRANCH.  `AvroUnionValue` holds the branch
-// index beside the value, because a union of `["null","string"]` and a
-// union of `["string","null"]` encode the same string differently, and
-// a value that had forgotten which union it belonged to could not be
-// written back.
+// There is one arm per type and no untyped escape, so given a schema
+// and a value that fits it, `avrobinary.encode` always knows what to
+// write.  `check` is the call that says whether a value fits.
 //
-// ONE ARM PER TYPE, AND NOT ONE MORE.  There is no `AvroAny` and no
-// untyped escape: a value is always one of the fourteen, and the
-// schema says which.  That is what lets `avrobinary.encode` be total —
-// given a schema and a value of it, there is no case where it does not
-// know what to write.
+// Avro has two JSON forms, and they differ.  The JSON encoding of data
+// (specification section "JSON Encoding") writes a union value as
+// `{"<branch type name>": value}`, except for `null`, which is bare
+// `null`.  A field default (section "Complex Types", records) is
+// written as a value of the union's first branch with no wrapper.  In
+// both, a `bytes` or `fixed` value is a string whose characters U+0000
+// to U+00FF are the byte values.
 
+use std.json
 use avroerror
 use avroschema
 
@@ -44,11 +44,12 @@ pub enum AvroValue
     AvroBoolValue(b: Bool)
     // A 32-bit signed integer.
     AvroIntValue(n: Int)
-    // A 64-bit signed integer.  A separate arm from `AvroIntValue`
-    // because the two have different encodings and because a schema
-    // that says `int` may not be handed a value that does not fit one.
+    // A 64-bit signed integer.  A separate arm from `AvroIntValue`,
+    // because the two have different ranges and a schema that says
+    // `int` may not be handed a value that does not fit one.
     AvroLongValue(n: Int)
-    // A 32-bit float.
+    // A 32-bit float, held widened to a `Float`.  It is rounded to 32
+    // bits when it is encoded.
     AvroFloatValue(x: Float)
     // A 64-bit double.
     AvroDoubleValue(x: Float)
@@ -56,35 +57,26 @@ pub enum AvroValue
     AvroBytesValue(b: Bytes)
     // A length-prefixed byte sequence meant as UTF-8.  A separate arm
     // from `AvroBytesValue` although the encodings are identical,
-    // because the schema distinguishes them and a round trip must.
+    // because the schema distinguishes them.
     AvroStrValue(s: Str)
     // A record: one value per field, in the schema's field order.
     AvroRecordValue(fields: [AvroValue])
-    // An enum: the symbol's INDEX, not its text.  The index is the
-    // encoding, and resolution maps a writer's index to a reader's.
+    // An enum: the symbol's index, which is its encoding.
     AvroEnumValue(index: Int)
     // An array.
     AvroArrayValue(items: [AvroValue])
     // A map: keys and values in two parallel lists, in the order the
-    // file carried them.
-    //
-    // Two lists rather than a pair list because Avro's map keys are
-    // always strings and a caller looking one up wants the keys
-    // without walking pairs.  The ORDER is kept because a round trip
-    // must reproduce the file, and Avro does not say a map is sorted.
+    // input carried them.  Avro does not say a map is sorted, so the
+    // order is kept for a round trip.
     AvroMapValue(keys: [Str], values: [AvroValue])
-    // A union: which branch, and the value of that branch.
-    //
-    // THE ARM THAT CARRIES THE BRANCH.  A union of `["null","string"]`
-    // and one of `["string","null"]` encode the same string
-    // differently, so a value that forgot its branch could not be
-    // written back.
+    // A union: which branch, and the value of that branch as a
+    // one-element list.
     AvroUnionValue(branch: Int, value: [AvroValue])
     // A fixed-length byte sequence, with no length prefix on the wire.
     AvroFixedValue(b: Bytes)
 
 // A short, stable name for a value's kind: `"long"`, `"record"`,
-// `"union"`.
+// `"union"`.  They are the type names of `avroschema.type_name`.
 //
 // ```novo
 // use avrovalue
@@ -93,7 +85,21 @@ pub enum AvroValue
 //     println(avrovalue.kind_name(AvroNullValue))
 // ```
 pub fn kind_name(v: AvroValue) -> Str []
-    todo("avro-nv.avrovalue.kind_name")
+    match v
+        AvroNullValue        => "null"
+        AvroBoolValue(_)     => "boolean"
+        AvroIntValue(_)      => "int"
+        AvroLongValue(_)     => "long"
+        AvroFloatValue(_)    => "float"
+        AvroDoubleValue(_)   => "double"
+        AvroBytesValue(_)    => "bytes"
+        AvroStrValue(_)      => "string"
+        AvroRecordValue(_)   => "record"
+        AvroEnumValue(_)     => "enum"
+        AvroArrayValue(_)    => "array"
+        AvroMapValue(_, _)   => "map"
+        AvroUnionValue(_, _) => "union"
+        AvroFixedValue(_)    => "fixed"
 
 // A `long` value.
 //
@@ -104,7 +110,7 @@ pub fn kind_name(v: AvroValue) -> Str []
 //     println(avrovalue.kind_name(avrovalue.long_value(7)))
 // ```
 pub fn long_value(n: Int) -> AvroValue []
-    todo("avro-nv.avrovalue.long_value")
+    AvroLongValue(n)
 
 // A `string` value.
 //
@@ -115,7 +121,7 @@ pub fn long_value(n: Int) -> AvroValue []
 //     println(avrovalue.kind_name(avrovalue.str_value("hello")))
 // ```
 pub fn str_value(s: Str) -> AvroValue []
-    todo("avro-nv.avrovalue.str_value")
+    AvroStrValue(s)
 
 // A union value: a branch index and the value on it.
 //
@@ -127,7 +133,7 @@ pub fn str_value(s: Str) -> AvroValue []
 //         avrovalue.union_value(1, avrovalue.str_value("hello"))))
 // ```
 pub fn union_value(branch: Int, v: AvroValue) -> AvroValue []
-    todo("avro-nv.avrovalue.union_value")
+    AvroUnionValue(branch, [v])
 
 // The value inside a union, or `None` for a value that is not a union.
 //
@@ -140,15 +146,16 @@ pub fn union_value(branch: Int, v: AvroValue) -> AvroValue []
 //         None    => println("not a union")
 // ```
 pub fn union_inner(v: AvroValue) -> ?AvroValue []
-    todo("avro-nv.avrovalue.union_inner")
+    match v
+        AvroUnionValue(_, inner) => list.first(inner)
+        _                        => None
 
 // The value of a record's field by name, given the record's schema.
 //
-// Records are encoded positionally and decoded into a positional list,
-// so reading a field by name needs the schema.  Taking it here rather
-// than storing names in every record value is what keeps a
-// million-record decode from carrying a million copies of the same
-// field names.
+// Records are decoded into a positional list, so reading a field by
+// name needs the schema.  Taking it here, rather than storing names in
+// every record value, keeps a decode of many records from carrying a
+// copy of the field names in each.
 //
 // ```novo
 // use avrovalue
@@ -163,7 +170,12 @@ pub fn union_inner(v: AvroValue) -> ?AvroValue []
 //         Err(e) => println(e.message())
 // ```
 pub fn field_of(v: AvroValue, s: AvroSchema, name: Str) -> ?AvroValue []
-    todo("avro-nv.avrovalue.field_of")
+    let AvroRecordValue(fields) = v else
+        return None
+    for i in 0..list.len(s.fields)
+        if s.fields[i].name == name and i < list.len(fields)
+            return Some(fields[i])
+    None
 
 // The value of a map's key, or `None`.
 //
@@ -176,19 +188,36 @@ pub fn field_of(v: AvroValue, s: AvroSchema, name: Str) -> ?AvroValue []
 //         None    => println("not a map, or no such key")
 // ```
 pub fn map_get(v: AvroValue, key: Str) -> ?AvroValue []
-    todo("avro-nv.avrovalue.map_get")
+    let AvroMapValue(keys, values) = v else
+        return None
+    for i in 0..list.len(keys)
+        if keys[i] == key
+            return Some(values[i])
+    None
+
+// A shape fault at a path.
+fn shape(detail: Str, path: Str) -> AvroFault
+    avroerror.fault(AvroBadSchemaShape(detail), avroerror.at_path(path))
+
+// The path of a schema's own position, for a named type its full name.
+fn path_in(s: AvroSchema, path: Str) -> Str
+    if path == "" and s.full_name != ""
+        return s.full_name
+    path
 
 // Whether a value fits a schema, checked all the way down.
 //
-// `AvroBadSchemaShape`, which `avroerror.is_schema_error` answers
-// true for, naming the path where it did not — a record
-// with the wrong number of fields, an `int` value under a `string`
-// schema, a union branch outside the union, an `enum` index outside
-// the symbols, a `fixed` of the wrong length.
+// Answers how many values were checked, the value itself and every
+// value inside it.  `AvroBadSchemaShape` names the path where the value
+// did not fit: a record with the wrong number of fields, an `int`
+// value under a `string` schema, an `int` outside 32 bits, a union
+// branch outside the union, an `enum` index outside the symbols, a
+// `fixed` of the wrong length.  `avroerror.is_schema_error` answers
+// true for it.
 //
-// THE CALL A WRITER MAKES BEFORE IT ENCODES.  Avro's encoding has no
+// A writer calls this before it encodes.  Avro's encoding has no
 // markers, so a value that did not fit its schema would be written as
-// bytes nobody can read back and nothing would say so.
+// bytes nobody can read back.
 //
 // ```novo
 // use avrovalue
@@ -203,15 +232,63 @@ pub fn map_get(v: AvroValue, key: Str) -> ?AvroValue []
 //         Err(e) => println(e.message())
 // ```
 pub fn check(v: AvroValue, s: AvroSchema) -> Result<Int, AvroFault> []
-    todo("avro-nv.avrovalue.check")
+    check_in(avroschema.defs_of(s), v, s, "")
+
+// `check`, with the named types a reference is looked up in.
+fn check_in(defs: [AvroSchema], v: AvroValue, s0: AvroSchema, path0: Str) -> Result<Int, AvroFault>
+    let s = avroschema.deref(defs, s0)
+    let here = path_in(s, path0)
+    if s.is_reference
+        return Err(avroerror.fault(AvroUnknownType(s.full_name), avroerror.at_path(here)))
+    let want = avroschema.type_name(s.kind)
+    if kind_name(v) != want
+        return Err(shape("a ${kind_name(v)} value where the schema has ${want}", here))
+    match v
+        AvroIntValue(n)            =>
+            if n < -2147483648 or n > 2147483647
+                return Err(shape("${n} does not fit an int", here))
+            Ok(1)
+        AvroEnumValue(i)           =>
+            if i < 0 or i >= list.len(s.symbols)
+                return Err(shape("enum index ${i} is outside ${list.len(s.symbols)} symbols", here))
+            Ok(1)
+        AvroFixedValue(b)          =>
+            if bytes.len(b) != s.fixed_size
+                return Err(shape("${bytes.len(b)} bytes where the fixed has ${s.fixed_size}", here))
+            Ok(1)
+        AvroRecordValue(fields)    =>
+            if list.len(fields) != list.len(s.fields)
+                return Err(shape("${list.len(fields)} fields where the record has ${list.len(s.fields)}",
+                                 here))
+            var n = 1
+            for i in 0..list.len(fields)
+                n += check_in(defs, fields[i], s.fields[i].schema, here + "." + s.fields[i].name)!
+            Ok(n)
+        AvroArrayValue(items)      =>
+            var n = 1
+            for i in 0..list.len(items)
+                n += check_in(defs, items[i], s.element[0], "${here}[${i}]")!
+            Ok(n)
+        AvroMapValue(keys, values) =>
+            if list.len(keys) != list.len(values)
+                return Err(shape("${list.len(keys)} keys and ${list.len(values)} values", here))
+            var n = 1
+            for i in 0..list.len(values)
+                n += check_in(defs, values[i], s.element[0], "${here}[${keys[i]}]")!
+            Ok(n)
+        AvroUnionValue(b, inner)   =>
+            if b < 0 or b >= list.len(s.branches) or list.len(inner) != 1
+                return Err(shape("branch ${b} is outside a union of ${list.len(s.branches)}", here))
+            Ok(1 + check_in(defs, inner[0], s.branches[b], here)!)
+        _                          => Ok(1)
 
 // The value a field default's JSON text denotes, under a schema.
 //
-// The specification's default encoding, which is NOT the same as the
-// JSON encoding of Avro data: a `bytes` default is a string whose code
-// points are the byte values, and a union's default is a value of its
-// FIRST branch with no branch name around it.  Both are traps, and
-// both live here rather than in a caller.
+// This is the specification's default encoding, which is not the JSON
+// encoding of data: a union's default is a value of its first branch
+// with no branch name around it, and a record's missing field takes
+// that field's own default.  A `bytes` or `fixed` default is a string
+// whose characters are the byte values.
 //
 // `AvroBadDefault` when the JSON does not fit.
 //
@@ -227,15 +304,20 @@ pub fn check(v: AvroValue, s: AvroSchema) -> Result<Int, AvroFault> []
 //                 Err(e) => println(e.message())
 //         Err(e) => println(e.message())
 // ```
-pub fn from_default_json(json: Str, s: AvroSchema) -> Result<AvroValue, AvroFault> []
-    todo("avro-nv.avrovalue.from_default_json")
+pub fn from_default_json(text: Str, s: AvroSchema) -> Result<AvroValue, AvroFault> []
+    match from_text(text, s, true)
+        Ok(v)  => Ok(v)
+        Err(e) => Err(avroerror.fault(AvroBadDefault(e.at.path), e.at))
 
 // The value as Avro's JSON encoding, under a schema.
 //
-// Not the same as the default encoding above: here a union value is
-// `{"<branch type name>": <value>}` except for `null`, which is bare
-// `null`, and `bytes` is a string whose code points are the byte
-// values.  The form `avro-tools tojson` writes.
+// A union value is `{"<branch type name>": value}`, with a named
+// branch named by its full name, except for `null`, which is bare
+// `null`.  A `bytes` or `fixed` value is a string whose characters are
+// the byte values.  A `float` or `double` that is not a number is the
+// string `"NaN"`, `"Infinity"` or `"-Infinity"`, because JSON has no
+// literal for them.  `AvroBadSchemaShape` when the value does not fit
+// the schema.
 //
 // ```novo
 // use avrovalue
@@ -250,9 +332,78 @@ pub fn from_default_json(json: Str, s: AvroSchema) -> Result<AvroValue, AvroFaul
 //         Err(e) => println(e.message())
 // ```
 pub fn to_json(v: AvroValue, s: AvroSchema) -> Result<Str, AvroFault> []
-    todo("avro-nv.avrovalue.to_json")
+    let defs = avroschema.defs_of(s)
+    check_in(defs, v, s, "")!
+    Ok(json_of(defs, v, s))
+
+// A string as a JSON string literal.
+fn quote(s: Str) -> Str
+    json.stringify(json.string(s))
+
+// Bytes as the JSON string whose characters are the byte values.
+fn latin1_json(b: Bytes) -> Str
+    var chars: [Str] = []
+    for i in 0..bytes.len(b)
+        list.push(chars, str.from_char(bytes.byte_at(b, i) ?? 0))
+    quote(str.join(chars, ""))
+
+// A float as JSON, always with a fraction or an exponent so that a
+// reader sees a floating-point number.
+fn float_json(x: Float) -> Str
+    if x != x
+        return "\"NaN\""
+    if x > 1.7976931348623157e308
+        return "\"Infinity\""
+    if x < -1.7976931348623157e308
+        return "\"-Infinity\""
+    let text = str.from_float(x)
+    if str.contains(text, ".") or str.contains(text, "e")
+        return text
+    text + ".0"
+
+// `to_json` for a value already checked against its schema.
+fn json_of(defs: [AvroSchema], v: AvroValue, s0: AvroSchema) -> Str
+    let s = avroschema.deref(defs, s0)
+    match v
+        AvroNullValue              => "null"
+        AvroBoolValue(b)           => str.from_bool(b)
+        AvroIntValue(n)            => str.from_int(n)
+        AvroLongValue(n)           => str.from_int(n)
+        AvroFloatValue(x)          => float_json(x)
+        AvroDoubleValue(x)         => float_json(x)
+        AvroBytesValue(b)          => latin1_json(b)
+        AvroFixedValue(b)          => latin1_json(b)
+        AvroStrValue(t)            => quote(t)
+        AvroEnumValue(i)           => quote(s.symbols[i])
+        AvroRecordValue(fields)    =>
+            var parts: [Str] = []
+            for i in 0..list.len(fields)
+                list.push(parts,
+                    quote(s.fields[i].name) + ":" + json_of(defs, fields[i], s.fields[i].schema))
+            "{" + str.join(parts, ",") + "}"
+        AvroArrayValue(items)      =>
+            var parts: [Str] = []
+            for item in items
+                list.push(parts, json_of(defs, item, s.element[0]))
+            "[" + str.join(parts, ",") + "]"
+        AvroMapValue(keys, values) =>
+            var parts: [Str] = []
+            for i in 0..list.len(keys)
+                list.push(parts, quote(keys[i]) + ":" + json_of(defs, values[i], s.element[0]))
+            "{" + str.join(parts, ",") + "}"
+        AvroUnionValue(b, inner)   =>
+            let branch = avroschema.deref(defs, s.branches[b])
+            match branch.kind
+                AvroNull => "null"
+                _        =>
+                    let name = avroschema.branch_key(branch)
+                    "{" + quote(name) + ":" + json_of(defs, inner[0], branch) + "}"
 
 // A value from Avro's JSON encoding, under a schema.
+//
+// The inverse of `to_json`.  A record field missing from the JSON
+// takes the field's default, and is `AvroBadSchemaShape` when it has
+// none.
 //
 // ```novo
 // use avrovalue
@@ -266,22 +417,165 @@ pub fn to_json(v: AvroValue, s: AvroSchema) -> Result<Str, AvroFault> []
 //                 Err(e) => println(e.message())
 //         Err(e) => println(e.message())
 // ```
-pub fn from_json(json: Str, s: AvroSchema) -> Result<AvroValue, AvroFault> []
-    todo("avro-nv.avrovalue.from_json")
+pub fn from_json(text: Str, s: AvroSchema) -> Result<AvroValue, AvroFault> []
+    from_text(text, s, false)
+
+// Either JSON form, from text.
+fn from_text(text: Str, s: AvroSchema, default_rules: Bool) -> Result<AvroValue, AvroFault>
+    let Some(j) = json.parse(text) else
+        return Err(shape("the text is not JSON", path_in(s, "")))
+    from_node(avroschema.defs_of(s), j, s, path_in(s, ""), default_rules)
+
+// Whether a JSON number is written as an integer.
+fn is_integer(j: JsonValueH) -> Bool
+    let text = json.stringify(j)
+    json.type_of(j) == "number" and not str.contains(text, ".") and not str.contains(text, "e")
+        and not str.contains(text, "E")
+
+// A float from JSON: a number, or one of the three names JSON has no
+// literal for.
+fn float_of(j: JsonValueH) -> ?Float
+    if json.type_of(j) == "number"
+        return json.to_float(j)
+    let name = json.to_str(j) ?? ""
+    match name
+        "NaN"       => Some(0.0 / 0.0)
+        "Infinity"  => Some(1.0 / 0.0)
+        "-Infinity" => Some(-1.0 / 0.0)
+        _           => None
+
+// Bytes from the JSON string whose characters are the byte values.
+fn bytes_of(j: JsonValueH) -> ?Bytes
+    if json.type_of(j) != "string"
+        return None
+    match avroschema.latin1_bytes(json.to_str(j) ?? "")
+        None     => None
+        Some(bs) => Some(bytes.from_byte_list(bs))
+
+// A value when the JSON fitted, and the fault when it did not.
+fn fitting(ok: Bool, v: AvroValue, wrong: AvroFault) -> Result<AvroValue, AvroFault>
+    if ok
+        return Ok(v)
+    Err(wrong)
+
+// One JSON node, under a schema.  With `default_rules` a union is read
+// as its first branch with no wrapper.
+fn from_node(defs: [AvroSchema], j: JsonValueH, s0: AvroSchema, path: Str,
+             default_rules: Bool) -> Result<AvroValue, AvroFault>
+    let s = avroschema.deref(defs, s0)
+    let t = json.type_of(j)
+    let what = avroschema.type_name(s.kind)
+    let wrong = shape("a JSON ${t} where the schema has ${what}", path)
+    match s.kind
+        AvroNull    => fitting(t == "null", AvroNullValue, wrong)
+        AvroBoolean => fitting(t == "boolean", AvroBoolValue(json.to_bool(j) ?? false), wrong)
+        AvroInt     =>
+            let n = json.to_int(j) ?? 0
+            if is_integer(j) and n >= -2147483648 and n <= 2147483647
+                return Ok(AvroIntValue(n))
+            Err(wrong)
+        AvroLong    => fitting(is_integer(j), AvroLongValue(json.to_int(j) ?? 0), wrong)
+        AvroFloat   =>
+            match float_of(j)
+                Some(x) => Ok(AvroFloatValue(x))
+                None    => Err(wrong)
+        AvroDouble  =>
+            match float_of(j)
+                Some(x) => Ok(AvroDoubleValue(x))
+                None    => Err(wrong)
+        AvroString  => fitting(t == "string", AvroStrValue(json.to_str(j) ?? ""), wrong)
+        AvroBytes   =>
+            match bytes_of(j)
+                Some(b) => Ok(AvroBytesValue(b))
+                None    => Err(wrong)
+        AvroFixed   =>
+            match bytes_of(j)
+                Some(b) =>
+                    if bytes.len(b) != s.fixed_size
+                        return Err(wrong)
+                    Ok(AvroFixedValue(b))
+                None    => Err(wrong)
+        AvroEnum    =>
+            let i = avroschema.symbol_index(s, json.to_str(j) ?? "")
+            if t == "string" and i >= 0
+                Ok(AvroEnumValue(i))
+            else
+                Err(wrong)
+        AvroArray   =>
+            if t != "array"
+                return Err(wrong)
+            var items: [AvroValue] = []
+            let nodes = json.to_list(j) ?? []
+            for node in nodes
+                let at = "${path}[${list.len(items)}]"
+                list.push(items, from_node(defs, node, s.element[0], at, default_rules)!)
+            Ok(AvroArrayValue(items))
+        AvroMap     =>
+            if t != "object"
+                return Err(wrong)
+            var values: [AvroValue] = []
+            let keys = json.keys(j)
+            for k in keys
+                let node = json.get(j, k) ?? j
+                list.push(values, from_node(defs, node, s.element[0], "${path}[${k}]", default_rules)!)
+            Ok(AvroMapValue(keys, values))
+        AvroRecord  => record_from(defs, j, s, path, default_rules)
+        AvroUnion   => union_from(defs, j, s, path, default_rules)
+
+// A record from a JSON object.  A missing field takes its default.
+fn record_from(defs: [AvroSchema], j: JsonValueH, s: AvroSchema, path: Str,
+               default_rules: Bool) -> Result<AvroValue, AvroFault>
+    if json.type_of(j) != "object"
+        return Err(shape("a JSON ${json.type_of(j)} where the schema has record", path))
+    var fields: [AvroValue] = []
+    for f in s.fields
+        let at = path + "." + f.name
+        match json.get(j, f.name)
+            Some(node) => list.push(fields, from_node(defs, node, f.schema, at, default_rules)!)
+            None       =>
+                if not f.has_default
+                    return Err(shape("field `${f.name}` is missing and has no default", at))
+                // `default_json` is always the compact JSON that
+                // `avroschema` wrote, so it parses.
+                let d = json.parse(f.default_json) ?? j
+                list.push(fields, from_node(defs, d, f.schema, at, true)!)
+    Ok(AvroRecordValue(fields))
+
+// A union from JSON.  Under the default rules it is its first branch;
+// otherwise `null`, or an object whose one key names the branch.
+fn union_from(defs: [AvroSchema], j: JsonValueH, s: AvroSchema, path: Str,
+              default_rules: Bool) -> Result<AvroValue, AvroFault>
+    if default_rules
+        if list.len(s.branches) == 0
+            return Err(shape("an empty union has no default", path))
+        return Ok(AvroUnionValue(0, [from_node(defs, j, s.branches[0], path, true)!]))
+    if json.type_of(j) == "null"
+        let b = avroschema.null_branch(s)
+        if b < 0
+            return Err(shape("null where the union has no null branch", path))
+        return Ok(AvroUnionValue(b, [AvroNullValue]))
+    let keys = json.keys(j)
+    if json.type_of(j) != "object" or list.len(keys) != 1
+        return Err(shape("a union value is null or an object naming its branch", path))
+    let b = avroschema.branch_index(s, keys[0])
+    if b < 0
+        return Err(shape("`${keys[0]}` is not a branch of the union", path))
+    let node = json.get(j, keys[0]) ?? j
+    Ok(AvroUnionValue(b, [from_node(defs, node, s.branches[b], path, false)!]))
 
 // Compare two values under a schema, in the specification's sort
-// order.
+// order (section "Sort Order").
 //
-// Answers a negative number, zero or a positive one.  The order is not
-// the obvious one: a record compares field by field in the order the
-// fields are DECLARED, skipping fields whose `order` is `"ignore"` and
-// reversing those whose `order` is `"descending"`; an enum compares by
-// symbol INDEX and not alphabetically; a union compares by branch
-// index first.
-//
-// Published because Avro data is sorted by this order in every system
-// that sorts it, and a caller that used its own would disagree with
-// every other reader of the same file.
+// Answers a negative number, zero or a positive one.  Numbers compare
+// by value and booleans with false first.  `bytes` and `fixed` compare
+// byte by byte as unsigned numbers, and `string` compares its UTF-8
+// bytes the same way, which is Unicode code point order.  An array
+// compares item by item, and a shorter prefix comes first.  An enum
+// compares by symbol index, not alphabetically.  A union compares by
+// branch index first.  A record compares field by field in the order
+// the fields are declared, skipping a field whose `order` is
+// `"ignore"` and reversing one whose `order` is `"descending"`.  The
+// specification gives maps no order, and two maps compare equal.
 //
 // ```novo
 // use avrovalue
@@ -295,4 +589,56 @@ pub fn from_json(json: Str, s: AvroSchema) -> Result<AvroValue, AvroFault> []
 //         Err(e) => println(e.message())
 // ```
 pub fn compare(a: AvroValue, b: AvroValue, s: AvroSchema) -> Int []
-    todo("avro-nv.avrovalue.compare")
+    compare_in(avroschema.defs_of(s), a, b, s)
+
+// The sign of a difference, as -1, 0 or 1.
+fn sign(less: Bool, more: Bool) -> Int
+    if less
+        return -1
+    if more
+        return 1
+    0
+
+// Two byte sequences in unsigned lexicographic order.
+fn compare_bytes(x: Bytes, y: Bytes) -> Int
+    let n = math.min(bytes.len(x), bytes.len(y))
+    for i in 0..n
+        let p = bytes.byte_at(x, i) ?? 0
+        let q = bytes.byte_at(y, i) ?? 0
+        if p != q
+            return sign(p < q, p > q)
+    sign(bytes.len(x) < bytes.len(y), bytes.len(x) > bytes.len(y))
+
+// `compare`, with the named types a reference is looked up in.
+fn compare_in(defs: [AvroSchema], a: AvroValue, b: AvroValue, s0: AvroSchema) -> Int
+    let s = avroschema.deref(defs, s0)
+    match (a, b)
+        (AvroBoolValue(x), AvroBoolValue(y))         => sign(not x and y, x and not y)
+        (AvroIntValue(x), AvroIntValue(y))           => sign(x < y, x > y)
+        (AvroLongValue(x), AvroLongValue(y))         => sign(x < y, x > y)
+        (AvroFloatValue(x), AvroFloatValue(y))       => sign(x < y, x > y)
+        (AvroDoubleValue(x), AvroDoubleValue(y))     => sign(x < y, x > y)
+        (AvroBytesValue(x), AvroBytesValue(y))       => compare_bytes(x, y)
+        (AvroFixedValue(x), AvroFixedValue(y))       => compare_bytes(x, y)
+        (AvroStrValue(x), AvroStrValue(y))           => compare_bytes(bytes.from_str(x), bytes.from_str(y))
+        (AvroEnumValue(x), AvroEnumValue(y))         => sign(x < y, x > y)
+        (AvroArrayValue(xs), AvroArrayValue(ys))     =>
+            let n = math.min(list.len(xs), list.len(ys))
+            for i in 0..n
+                let c = compare_in(defs, xs[i], ys[i], s.element[0])
+                if c != 0
+                    return c
+            sign(list.len(xs) < list.len(ys), list.len(xs) > list.len(ys))
+        (AvroUnionValue(i, x), AvroUnionValue(j, y)) =>
+            if i != j
+                return sign(i < j, i > j)
+            compare_in(defs, x[0], y[0], s.branches[i])
+        (AvroRecordValue(xs), AvroRecordValue(ys))   =>
+            for i in 0..list.len(s.fields)
+                let f = s.fields[i]
+                if f.order != "ignore"
+                    let c = compare_in(defs, xs[i], ys[i], f.schema)
+                    if c != 0
+                        return if f.order == "descending" then 0 - c else c
+            0
+        _                                            => 0

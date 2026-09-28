@@ -1,8 +1,5 @@
 // avroresolve_tests.nv — schema resolution as a typed check, the
 // codec-as-a-value decision, the container file, and fingerprints.
-//
-// RED ON PURPOSE: every assertion reaches `not implemented:
-// avro-nv.<module>.<fn>`.
 
 use std.test
 use std.bytes
@@ -45,7 +42,7 @@ fn test_the_six_promotions_go_one_way_only() [io]
     test.assert(avroresolve.promotes(AvroLong, AvroDouble))
     test.assert(avroresolve.promotes(AvroFloat, AvroDouble))
 
-    test.case("string and bytes convert BOTH ways, because the encodings are identical")
+    test.case("string and bytes convert both ways, because the encodings are identical")
     test.assert(avroresolve.promotes(AvroString, AvroBytes))
     test.assert(avroresolve.promotes(AvroBytes, AvroString))
 
@@ -89,17 +86,27 @@ fn test_a_plan_says_read_skip_default_or_promote_per_field() [io]
     test.assert(avroresolve.step(AvroSkipField, 0, -1).reader_index == -1)
     test.assert(avroresolve.step(AvroDefaultField, -1, 2).writer_index == -1)
 
-    test.case("a reader field the writer lacks and that has no default is THE failure")
+    test.case("a reader field the writer lacks and that has no default is refused")
     test.assert(avroerror.is_schema_error(AvroMissingFieldNoDefault("nickname")))
     test.assert(not avroerror.is_corrupt(AvroMissingFieldNoDefault("nickname")))
 
 @test
-fn test_an_alias_is_the_writers_and_never_the_readers() [io]
-    // Getting that backwards is the reason a rename "did not work".
+fn test_an_alias_is_the_readers_and_never_the_writers() [io]
+    // A reader that renamed a type lists the old name as an alias.
     test.case("a name matches itself")
     match avroschema.parse("\"int\"")
         Ok(s)  => test.assert(avroresolve.names_match(s, s))
         Err(_) => test.fail("\"int\" is a schema")
+
+    test.case("the reader's alias matches the writer's old name, and not the other way")
+    let old_name = "{\"type\":\"fixed\",\"name\":\"Old\",\"size\":1}"
+    let new_name = "{\"type\":\"fixed\",\"name\":\"New\",\"aliases\":[\"Old\"],\"size\":1}"
+    match (avroschema.parse(old_name), avroschema.parse(new_name))
+        (Ok(o), Ok(n)) =>
+            test.assert(avroresolve.names_match(o, n))
+            test.assert(not avroresolve.names_match(n, o))
+            test.assert(not avroresolve.names_match(o, avroschema.primitive(AvroInt)))
+        _              => test.fail("both are schemas")
 
 @test
 fn test_decoding_through_a_plan_has_no_decisions_left_to_make() [io]
@@ -145,7 +152,7 @@ fn test_a_codec_is_a_value_because_avro_codec_is_an_open_set() [io]
     test.assert(avrocodec.is_known_name(avrocodec.AVRO_CODEC_BZIP2))
     test.assert(avrocodec.is_known_name(avrocodec.AVRO_CODEC_XZ))
 
-    test.case("and `zstd` is NOT one of them — the spelling is `zstandard`")
+    test.case("and `zstd` is not one of them — the spelling is `zstandard`")
     test.assert(not avrocodec.is_known_name("zstd"))
     test.assert(avrocodec.AVRO_CODEC_ZSTANDARD == "zstandard")
 
@@ -292,7 +299,7 @@ fn test_the_writer_takes_the_random_marker_rather_than_making_one() [io]
                     match avrofile.header_bytes(w, [], [])
                         Ok(h)  => test.assert(bytes.len(h) > 0)
                         Err(_) => test.fail("a header is bytes")
-                    match avrofile.append(w, avrovalue.long_value(1))
+                    match avrofile.append(w, AvroIntValue(1))
                         Ok(a)  => test.assert(bytes.len(a.block) == 0)
                         Err(_) => test.fail("one record buffers")
                     match avrofile.flush(w)
@@ -333,7 +340,7 @@ fn test_single_object_encoding_is_two_marker_bytes_and_eight_more() [io]
     test.assert(avrofp.AVRO_FINGERPRINT_BYTES == 8)
     test.assert(avrofp.AVRO_SINGLE_OBJECT_PREFIX_BYTES == 10)
 
-    test.case("a fingerprint is written LITTLE-endian, not network order")
+    test.case("a fingerprint is written little-endian, not network order")
     test.assert(bytes.len(avrofp.fingerprint_bytes(0)) == 8)
     match avrofp.fingerprint_from(bytes.zeros(8), 0)
         Ok(fp) => test.assert(fp == 0)
@@ -356,7 +363,7 @@ fn test_single_object_encoding_is_two_marker_bytes_and_eight_more() [io]
         Ok(s)  => test.assert(bytes.len(avrofp.single_object_prefix(s)) == 10)
         Err(_) => test.fail("\"null\" is a schema")
 
-    test.case("an unknown fingerprint is the CALLER missing a schema, not a bad message")
+    test.case("an unknown fingerprint is the caller missing a schema, not a bad message")
     test.assert(avroerror.is_unsupported(AvroUnknownFingerprint("63dd24e7cc258f8a")))
     match avrofp.schema_for(0, [])
         Ok(_)  => test.fail("no schema was offered")

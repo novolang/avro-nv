@@ -1,0 +1,166 @@
+// avroschemaedge_tests.nv — every refusal of the schema parser, the
+// written form of a schema, and the lookups on a parsed one.
+
+use std.test
+use avroerror
+use avroschema
+
+// A schema text and the fault kind it is refused with.
+fn refusals() -> [(Str, Str)]
+    [("5", "bad-schema-shape"),
+     ("[\"int\", 5]", "bad-schema-shape"),
+     ("{\"doc\":\"no type\"}", "bad-schema-shape"),
+     ("{\"type\":\"array\"}", "bad-schema-shape"),
+     ("{\"type\":\"map\",\"values\":\"Nope\"}", "unknown-type"),
+     ("{\"type\":\"record\",\"fields\":[]}", "bad-schema-shape"),
+     ("{\"type\":\"record\",\"name\":\"9R\",\"fields\":[]}", "bad-name"),
+     ("{\"type\":\"record\",\"name\":\"R\",\"namespace\":\"a..b\",\"fields\":[]}", "bad-name"),
+     ("{\"type\":\"record\",\"name\":\"int\",\"fields\":[]}", "bad-name"),
+     ("{\"type\":\"record\",\"name\":\"R\",\"aliases\":[\"-\"],\"fields\":[]}", "bad-name"),
+     ("{\"type\":\"record\",\"name\":\"R\"}", "bad-schema-shape"),
+     ("{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"type\":\"int\"}]}", "bad-schema-shape"),
+     ("{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"a.b\",\"type\":\"int\"}]}",
+        "bad-name"),
+     ("{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"a\"}]}", "bad-schema-shape"),
+     ("{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"a\",\"type\":\"Nope\"}]}",
+        "unknown-type"),
+     ("{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"a\",\"type\":\"int\",\"order\":\"up\"}]}",
+      "bad-schema-shape"),
+     ("{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"a\",\"type\":\"int\"},{\"name\":\"a\",\"type\":\"int\"}]}",
+      "bad-schema-shape"),
+     ("{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"a\",\"type\":{\"type\":\"record\",\"name\":\"R\",\"fields\":[]}}]}",
+      "duplicate-name"),
+     ("{\"type\":\"enum\",\"name\":\"E\"}", "bad-schema-shape"),
+     ("{\"type\":\"enum\",\"name\":\"E\",\"symbols\":[\"A-\"]}", "bad-name"),
+     ("{\"type\":\"enum\",\"name\":\"E\",\"symbols\":[\"A\",\"A\"]}", "bad-schema-shape"),
+     ("{\"type\":\"enum\",\"name\":\"E\",\"symbols\":[\"A\"],\"default\":\"B\"}", "bad-schema-shape"),
+     ("{\"type\":\"fixed\",\"name\":\"F\"}", "bad-schema-shape"),
+     ("{\"type\":\"fixed\",\"name\":\"F\",\"size\":-1}", "bad-schema-shape"),
+     ("[{\"type\":\"fixed\",\"name\":\"F\",\"size\":1},\"F\"]", "bad-schema-shape")]
+
+// A field type, a default, and whether the default fits.
+fn defaults() -> [(Str, Str, Bool)]
+    [("\"null\"", "null", true), ("\"null\"", "0", false),
+     ("\"boolean\"", "true", true), ("\"boolean\"", "1", false),
+     ("\"int\"", "2147483647", true), ("\"int\"", "2147483648", false), ("\"int\"", "1.5", false),
+     ("\"long\"", "-9", true), ("\"long\"", "1e3", false),
+     ("\"float\"", "1.5", true), ("\"double\"", "2", true), ("\"double\"", "\"x\"", false),
+     ("\"string\"", "\"x\"", true), ("\"bytes\"", "\"\\u00ff\"", true), ("\"bytes\"", "\"\\u0100\"", false),
+     ("{\"type\":\"fixed\",\"name\":\"F\",\"size\":2}", "\"ab\"", true),
+     ("{\"type\":\"fixed\",\"name\":\"F\",\"size\":2}", "\"a\"", false),
+     ("{\"type\":\"fixed\",\"name\":\"F\",\"size\":1}", "\"\\u0100\"", false),
+     ("{\"type\":\"enum\",\"name\":\"E\",\"symbols\":[\"A\"]}", "\"A\"", true),
+     ("{\"type\":\"enum\",\"name\":\"E\",\"symbols\":[\"A\"]}", "\"B\"", false),
+     ("{\"type\":\"array\",\"items\":\"int\"}", "[1,2]", true),
+     ("{\"type\":\"array\",\"items\":\"int\"}", "[1,\"x\"]", false),
+     ("{\"type\":\"array\",\"items\":\"int\"}", "{}", false),
+     ("{\"type\":\"map\",\"values\":\"int\"}", "{\"a\":1}", true),
+     ("{\"type\":\"map\",\"values\":\"int\"}", "{\"a\":\"x\"}", false),
+     ("{\"type\":\"map\",\"values\":\"int\"}", "[]", false),
+     ("[\"null\",\"int\"]", "null", true), ("[\"null\",\"int\"]", "1", false),
+     ("{\"type\":\"record\",\"name\":\"S\",\"fields\":[{\"name\":\"x\",\"type\":\"int\"},{\"name\":\"y\",\"type\":\"int\",\"default\":0}]}",
+      "{\"x\":1}", true),
+     ("{\"type\":\"record\",\"name\":\"S\",\"fields\":[{\"name\":\"x\",\"type\":\"int\"}]}",
+        "{}",
+        false),
+     ("{\"type\":\"record\",\"name\":\"S\",\"fields\":[{\"name\":\"x\",\"type\":\"int\"}]}",
+        "{\"x\":\"a\"}",
+        false),
+     ("{\"type\":\"record\",\"name\":\"S\",\"fields\":[{\"name\":\"x\",\"type\":\"int\"}]}",
+        "1",
+        false),
+     ("[\"R\",\"null\"]", "{\"f\":null}", true)]
+
+@test
+fn test_every_malformed_schema_is_refused_with_its_own_kind() [io]
+    for (text, kind) in refusals()
+        test.case(text)
+        match avroschema.parse(text)
+            Ok(_)  => test.fail("the schema is malformed")
+            Err(f) =>
+                test.assert_eq_str(avroerror.kind_name(f.kind), kind)
+                test.assert(avroerror.is_schema_error(f.kind))
+
+@test
+fn test_a_field_default_is_checked_against_its_type_at_parse() [io]
+    for (t, d, fits) in defaults()
+        test.case("${d} under ${t}")
+        let text = "{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"f\",\"type\":${t},\"default\":${d}}]}"
+        match avroschema.parse(text)
+            Ok(_)  => test.assert(fits)
+            Err(f) =>
+                test.assert(not fits)
+                test.assert_eq_str(avroerror.kind_name(f.kind), "bad-default")
+
+@test
+fn test_with_default_refuses_text_that_is_not_json() [io]
+    let f = avroschema.field("id", avroschema.primitive(AvroLong))
+    match avroschema.with_default(f, "{")
+        Ok(_)  => test.fail("`{` is not JSON")
+        Err(e) => test.assert_eq_str(avroerror.kind_name(e.kind), "bad-default")
+    match avroschema.with_default(f, "null")
+        Ok(_)  => test.fail("null does not fit a long")
+        Err(e) => test.assert_eq_str(e.at.path, "id")
+
+@test
+fn test_the_written_form_keeps_what_the_canonical_form_strips() [io]
+    let text = "{\"type\":\"record\",\"name\":\"User\",\"namespace\":\"com.example\",\"doc\":\"a user\",\"aliases\":[\"Person\"],\"fields\":[{\"name\":\"id\",\"type\":\"long\",\"default\":0,\"aliases\":[\"uid\"],\"order\":\"descending\"},{\"name\":\"kind\",\"type\":{\"type\":\"enum\",\"name\":\"Kind\",\"symbols\":[\"A\",\"B\"],\"default\":\"A\"}},{\"name\":\"k2\",\"type\":\"Kind\"},{\"name\":\"h\",\"type\":{\"type\":\"fixed\",\"name\":\"H\",\"size\":4}},{\"name\":\"xs\",\"type\":{\"type\":\"array\",\"items\":{\"type\":\"map\",\"values\":[\"null\",\"H\"]}}},{\"name\":\"d\",\"type\":{\"type\":\"bytes\",\"logicalType\":\"decimal\",\"precision\":5,\"scale\":2}},{\"name\":\"t\",\"type\":{\"type\":\"long\",\"logicalType\":\"timestamp-millis\"}}]}"
+    match avroschema.parse(text)
+        Err(e) => test.fail(e.message())
+        Ok(s)  =>
+            let written = avroschema.to_json(s)
+            test.case("the written form is complete")
+            test.assert_eq_str(written,
+                               "{\"type\":\"record\",\"name\":\"com.example.User\",\"doc\":\"a user\",\"aliases\":[\"com.example.Person\"],\"fields\":[{\"name\":\"id\",\"type\":\"long\",\"default\":0,\"aliases\":[\"uid\"],\"order\":\"descending\"},{\"name\":\"kind\",\"type\":{\"type\":\"enum\",\"name\":\"com.example.Kind\",\"symbols\":[\"A\",\"B\"],\"default\":\"A\"}},{\"name\":\"k2\",\"type\":\"com.example.Kind\"},{\"name\":\"h\",\"type\":{\"type\":\"fixed\",\"name\":\"com.example.H\",\"size\":4}},{\"name\":\"xs\",\"type\":{\"type\":\"array\",\"items\":{\"type\":\"map\",\"values\":[\"null\",\"com.example.H\"]}}},{\"name\":\"d\",\"type\":{\"type\":\"bytes\",\"logicalType\":\"decimal\",\"precision\":5,\"scale\":2}},{\"name\":\"t\",\"type\":{\"type\":\"long\",\"logicalType\":\"timestamp-millis\"}}]}")
+            test.case("and it parses back to the same canonical form")
+            match avroschema.parse(written)
+                Err(e) => test.fail(e.message())
+                Ok(t)  => test.assert_eq_str(avroschema.canonical_form(t), avroschema.canonical_form(s))
+            test.case("the named types, in the order they begin")
+            test.assert_eq_str(str.join(avroschema.named_types(s), " "),
+                               "com.example.User com.example.Kind com.example.H")
+
+@test
+fn test_a_recursive_type_is_written_by_name_inside_itself() [io]
+    let text = "{\"type\":\"record\",\"name\":\"L\",\"fields\":[{\"name\":\"next\",\"type\":[\"null\",\"L\"]}]}"
+    match avroschema.parse(text)
+        Err(e) => test.fail(e.message())
+        Ok(s)  =>
+            test.assert_eq_str(avroschema.to_json(s),
+                               "{\"type\":\"record\",\"name\":\"L\",\"fields\":[{\"name\":\"next\",\"type\":[\"null\",\"L\"]}]}")
+            let inner = s.fields[0].schema.branches[1]
+            test.assert(inner.is_reference)
+            test.assert_eq_str(avroschema.to_json(inner), "\"L\"")
+
+@test
+fn test_a_name_is_resolved_against_the_null_namespace_too() [io]
+    let text = "{\"type\":\"record\",\"name\":\"a.R\",\"fields\":[{\"name\":\"x\",\"type\":{\"type\":\"fixed\",\"name\":\"F\",\"namespace\":\"\",\"size\":1}},{\"name\":\"y\",\"type\":\"F\"},{\"name\":\"z\",\"type\":{\"type\":\"error\",\"name\":\"Oops\",\"fields\":[]}}]}"
+    match avroschema.parse(text)
+        Err(e) => test.fail(e.message())
+        Ok(s)  =>
+            test.assert_eq_str(s.fields[1].schema.full_name, "F")
+            test.assert_eq_str(avroschema.type_name(s.fields[2].schema.kind), "record")
+    test.case("a type given as a nested schema object")
+    match avroschema.parse("{\"type\":{\"type\":\"array\",\"items\":\"int\"}}")
+        Err(e) => test.fail(e.message())
+        Ok(s)  => test.assert_eq_str(avroschema.type_name(s.kind), "array")
+
+@test
+fn test_the_lookups_on_a_parsed_schema() [io]
+    let text = "{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"a\",\"type\":{\"type\":\"enum\",\"name\":\"E\",\"symbols\":[\"X\",\"Y\"]}},{\"name\":\"u\",\"type\":[\"null\",\"E\",\"string\"]}]}"
+    match avroschema.parse(text)
+        Err(e) => test.fail(e.message())
+        Ok(s)  =>
+            match avroschema.field_named(s, "u")
+                None    => test.fail("R has a field u")
+                Some(f) =>
+                    test.assert(avroschema.branch_index(f.schema, "E") == 1)
+                    test.assert(avroschema.branch_index(f.schema, "int") == -1)
+            test.assert(avroschema.symbol_index(s.fields[0].schema, "Y") == 1)
+    test.case("the naming rules")
+    test.assert(avroschema.is_legal_name("a.b.C"))
+    test.assert(not avroschema.is_legal_name(""))
+    test.assert(not avroschema.is_legal_name(".a"))
+    test.assert(not avroschema.is_legal_name("a."))
+    test.assert(not avroschema.is_legal_name("a.9"))
+    test.assert_eq_str(avroschema.namespace_of("a.b.C"), "a.b")

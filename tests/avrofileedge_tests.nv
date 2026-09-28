@@ -1,0 +1,280 @@
+// avrofileedge_tests.nv — a container file written and read back, a
+// damaged one, and a codec supplied by the caller.
+
+use std.test
+use std.bytes
+use avrocodec
+use avroerror
+use avrofile
+use avroschema
+use avrovalue
+
+// A schema from its JSON text.
+fn schema(text: Str) -> AvroSchema
+    match avroschema.parse(text)
+        Ok(s)  => s
+        Err(_) => avroschema.primitive(AvroNull)
+
+// A sync marker for the tests: sixteen bytes a record will not hold.
+fn marker() -> Bytes
+    bytes.from_hex("f00dfeedcafebabe0123456789abcdef") ?? bytes.zeros(16)
+
+// A "snappy" codec whose compression is a copy, so the framing this
+// package adds, the CRC-32C trailer, is what the test sees.
+fn copy_size(src: Bytes, at: Int, len: Int) -> Int
+    len
+
+fn copy_run(src: Bytes, at: Int, len: Int) -> Bytes
+    bytes.slice(src, at, at + len)
+
+// A codec that declares a size it does not deliver.
+fn liar_size(src: Bytes, at: Int, len: Int) -> Int
+    len + 1
+
+// A codec whose payload declares no size.
+fn broken_size(src: Bytes, at: Int, len: Int) -> Int
+    -1
+
+// A whole file: header, the blocks the appends completed, and the
+// final block.
+fn write_file(w0: AvroWriter, values: [AvroValue], keys: [Str], meta: [Bytes]) -> Bytes
+    var out = bytes.zeros(0)
+    match avrofile.header_bytes(w0, keys, meta)
+        Ok(h)  =>
+            out = out + h
+        Err(_) =>
+            return out
+    var w = w0
+    for v in values
+        match avrofile.append(w, v)
+            Ok(a)  =>
+                out = out + a.block
+                w = a.writer
+            Err(_) =>
+                return out
+    match avrofile.flush(w)
+        Ok(b)  => out + b
+        Err(_) => out
+
+@test
+fn test_a_file_written_here_reads_back_block_by_block() [io]
+    let s = schema("{\"type\":\"record\",\"name\":\"P\",\"fields\":[{\"name\":\"x\",\"type\":\"int\"},{\"name\":\"s\",\"type\":\"string\"}]}")
+    let Ok(snappy) = avrocodec.codec("snappy", copy_size, copy_run, copy_run) else
+        return test.fail("snappy is a legal codec name")
+    let Ok(w0) = avrofile.writer(s, snappy, marker()) else
+        return test.fail("sixteen bytes is a marker")
+    let w = avrofile.with_block_records(w0, 3)
+    var values: [AvroValue] = []
+    for i in 0..7
+        list.push(values, AvroRecordValue([AvroIntValue(i), AvroStrValue("n${i}")]))
+    let file = write_file(w, values, ["app.owner"], [bytes.from_str("tests")])
+
+    test.case("the header carries the schema, the codec and the caller's metadata")
+    match avrofile.read_header(file)
+        Err(e) => test.fail(e.message())
+        Ok(h)  =>
+            test.assert_eq_str(h.codec, "snappy")
+            test.assert_eq_str(bytes.to_str(avrofile.meta(h, "app.owner") ?? bytes.zeros(0)), "tests")
+            test.assert_none(avrofile.meta(h, "app.missing"))
+            test.assert(h.sync == marker())
+            test.assert_eq_str(avroschema.canonical_form(h.schema), avroschema.canonical_form(s))
+
+    test.case("without the codec the file is refused when it is opened")
+    match avrofile.reader(file, avrocodec.only_null())
+        Ok(_)  => test.fail("snappy was not supplied")
+        Err(f) => test.assert(avroerror.is_unsupported(f.kind))
+
+    test.case("with it the blocks read, skip and count")
+    match avrofile.reader(file, [snappy])
+        Err(e) => test.fail(e.message())
+        Ok(r)  =>
+            match avrofile.next_block(r, file)
+                Ok(b)  => test.assert(b.count == 3)
+                Err(e) => test.fail(e.message())
+            match avrofile.skip_block(r, file)
+                Err(e) => test.fail(e.message())
+                Ok(r2) =>
+                    test.assert(avrofile.blocks_read(r2) == 1 and avrofile.records_read(r2) == 3)
+                    match avrofile.read_block(r2, file, -1)
+                        Err(e) => test.fail(e.message())
+                        Ok(b)  =>
+                            test.assert(list.len(b.records) == 3)
+                            test.assert(avrofile.records_read(b.reader) == 6)
+    match avrofile.read_all(file, [snappy], -1)
+        Err(e) => test.fail(e.message())
+        Ok(vs) =>
+            test.assert(list.len(vs) == 7)
+            match avrovalue.to_json(vs[6], s)
+                Ok(j)  => test.assert_eq_str(j, "{\"x\":6,\"s\":\"n6\"}")
+                Err(e) => test.fail(e.message())
+
+    test.case("a limit on the records is held")
+    match avrofile.read_all(file, [snappy], 4)
+        Ok(_)  => test.fail("seven records are more than four")
+        Err(f) => test.assert(avroerror.is_limit(f.kind))
+
+    test.case("the sync marker finds the next block from anywhere")
+    let first = avrofile.sync_after(file, 0, marker())
+    test.assert(first > 0)
+    test.assert(avrofile.sync_after(file, bytes.len(file), marker()) == -1)
+
+@test
+fn test_a_file_read_through_a_reader_schema() [io]
+    let s = schema("{\"type\":\"record\",\"name\":\"P\",\"fields\":[{\"name\":\"x\",\"type\":\"int\"}]}")
+    let Ok(w) = avrofile.writer(s, avrocodec.null_codec(), marker()) else
+        return test.fail("sixteen bytes is a marker")
+    let file = write_file(w, [AvroRecordValue([AvroIntValue(5)])], [], [])
+    let wider = schema("{\"type\":\"record\",\"name\":\"P\",\"fields\":[{\"name\":\"x\",\"type\":\"long\"},{\"name\":\"y\",\"type\":\"string\",\"default\":\"-\"}]}")
+    match avrofile.reader_with_schema(file, avrocodec.only_null(), wider)
+        Err(e) => test.fail(e.message())
+        Ok(r)  =>
+            match avrofile.read_block(r, file, -1)
+                Err(e) => test.fail(e.message())
+                Ok(b)  =>
+                    match avrovalue.to_json(b.records[0], wider)
+                        Ok(j)  => test.assert_eq_str(j, "{\"x\":5,\"y\":\"-\"}")
+                        Err(e) => test.fail(e.message())
+    test.case("a reader schema that does not resolve is refused at open")
+    match avrofile.reader_with_schema(file, avrocodec.only_null(), schema("\"int\""))
+        Ok(_)  => test.fail("a record does not read as an int")
+        Err(f) => test.assert(avroerror.is_schema_error(f.kind))
+
+@test
+fn test_a_damaged_file_names_what_is_wrong_with_it() [io]
+    let s = schema("\"long\"")
+    let Ok(w) = avrofile.writer(s, avrocodec.null_codec(), marker()) else
+        return test.fail("sixteen bytes is a marker")
+    let file = write_file(w, [AvroLongValue(1), AvroLongValue(2)], [], [])
+    let Ok(h) = avrofile.read_header(file) else
+        return test.fail("the header reads")
+    let at = h.header_bytes
+
+    test.case("a short prefix of the magic is truncated, a wrong one is not a file")
+    for (hex, kind) in [("4f62", "truncated"), ("4f6263", "bad-file-magic"), ("4f626a01", "truncated"),
+                        ("4f626a010201", "negative-length"), ("4f626a0100" + "00000000000000000000000000000000", "no-schema-in-file")]
+        match avrofile.read_header(bytes.from_hex(hex) ?? bytes.zeros(0))
+            Ok(_)  => test.fail("${hex} is not a whole header")
+            Err(f) => test.assert_eq_str(avroerror.kind_name(f.kind), kind)
+    match avrofile.read_header(bytes.slice(file, 0, at - 1))
+        Ok(_)  => test.fail("the sync marker is cut short")
+        Err(f) => test.assert(avroerror.is_incomplete(f.kind))
+    let bad_schema = bytes.from_hex("4f626a0102166176726f2e736368656d61023f00") ?? bytes.zeros(0)
+    match avrofile.read_header(bad_schema + marker())
+        Ok(_)  => test.fail("`?` is not a schema")
+        Err(f) => test.assert(avroerror.is_schema_error(f.kind))
+
+    test.case("a block whose marker differs is a sync mismatch")
+    var broken = bytes.clone(file)
+    bytes.set_u8(broken, bytes.len(broken) - 1, 0)
+    match avrofile.reader(broken, avrocodec.only_null())
+        Err(e) => test.fail(e.message())
+        Ok(r)  =>
+            match avrofile.read_block(r, broken, -1)
+                Ok(_)  => test.fail("the marker was changed")
+                Err(f) => test.assert_eq_str(avroerror.kind_name(f.kind), "sync-mismatch")
+            match avrofile.skip_block(r, broken)
+                Ok(_)  => test.fail("the marker was changed")
+                Err(f) => test.assert_eq_str(avroerror.kind_name(f.kind), "sync-mismatch")
+
+    test.case("a block cut short, and a block header that is not one")
+    match avrofile.reader(file, avrocodec.only_null())
+        Err(e) => test.fail(e.message())
+        Ok(r)  =>
+            test.assert(not avrofile.at_end(r, file))
+            match avrofile.next_block(r, bytes.slice(file, 0, bytes.len(file) - 1))
+                Ok(_)  => test.fail("the block is cut short")
+                Err(f) => test.assert_eq_str(avroerror.kind_name(f.kind), "truncated")
+            match avrofile.next_block(r, bytes.slice(file, 0, at) + bytes.from_byte_list([1, 2]))
+                Ok(_)  => test.fail("a count of -1 is not a count")
+                Err(f) => test.assert_eq_str(avroerror.kind_name(f.kind), "negative-length")
+            match avrofile.next_block(r, bytes.slice(file, 0, at))
+                Ok(_)  => test.fail("the file ends at the header")
+                Err(f) => test.assert_eq_str(avroerror.kind_name(f.kind), "truncated")
+
+    test.case("a record that does not decode names its block")
+    var wrong = bytes.slice(file, 0, at) + bytes.from_byte_list([2, 2, 0x80]) + marker()
+    match avrofile.reader(wrong, avrocodec.only_null())
+        Err(e) => test.fail(e.message())
+        Ok(r)  =>
+            match avrofile.read_block(r, wrong, -1)
+                Ok(_)  => test.fail("0x80 is not a whole long")
+                Err(f) =>
+                    test.assert_eq_str(avroerror.kind_name(f.kind), "truncated")
+                    test.assert(f.at.block == 0)
+
+    test.case("a block declaring more records than the default limit")
+    let many = bytes.slice(file, 0, at) + bytes.from_byte_list([0x80, 0x80, 0x80, 0x20, 0]) + marker()
+    match avrofile.reader(many, avrocodec.only_null())
+        Err(e) => test.fail(e.message())
+        Ok(r)  =>
+            match avrofile.read_block(r, many, -1)
+                Ok(_)  => test.fail("sixteen million and more records is over the limit")
+                Err(f) => test.assert(avroerror.is_limit(f.kind))
+
+@test
+fn test_a_writer_refuses_what_it_cannot_write() [io]
+    let s = schema("\"int\"")
+    let Ok(ro) = avrocodec.reader_codec("deflate", copy_size, copy_run) else
+        return test.fail("deflate is a legal codec name")
+    match avrofile.writer(s, ro, marker())
+        Ok(_)  => test.fail("a read-only codec cannot write")
+        Err(f) => test.assert_eq_str(avroerror.kind_name(f.kind), "bad-parameter")
+    let Ok(w) = avrofile.writer(s, avrocodec.null_codec(), marker()) else
+        return test.fail("sixteen bytes is a marker")
+    test.assert(avrofile.with_block_records(w, 0).block_records == 1)
+    for (keys, n) in [(["a"], 0), (["avro.custom"], 1)]
+        var values: [Bytes] = []
+        for _ in 0..n
+            list.push(values, bytes.zeros(1))
+        match avrofile.header_bytes(w, keys, values)
+            Ok(_)  => test.fail("the metadata is refused")
+            Err(f) => test.assert_eq_str(avroerror.kind_name(f.kind), "bad-parameter")
+    match avrofile.append(w, AvroStrValue("x"))
+        Ok(_)  => test.fail("a string does not fit an int")
+        Err(f) => test.assert(avroerror.is_schema_error(f.kind))
+
+@test
+fn test_a_supplied_codec_is_held_to_its_declared_size_and_its_checksum() [io]
+    let data = bytes.from_str("123456789")
+    let Ok(snappy) = avrocodec.codec("snappy", copy_size, copy_run, copy_run) else
+        return test.fail("snappy is a legal codec name")
+    match avrocodec.compress(snappy, data, 0, 9)
+        Err(e)     => test.fail(e.message())
+        Ok(packed) =>
+            test.case("the trailer is the CRC-32C of the data, big-endian: the check value E3069283")
+            test.assert(bytes.len(packed) == 13)
+            test.assert(bytes.to_hex(bytes.slice(packed, 9, 13)) == "e3069283")
+            match avrocodec.decompress(snappy, packed, 0, 13, -1)
+                Ok(b)  => test.assert(bytes.to_str(b) == "123456789")
+                Err(e) => test.fail(e.message())
+            test.case("a trailer that does not match")
+            var damaged = bytes.clone(packed)
+            bytes.set_u8(damaged, 12, 0)
+            match avrocodec.decompress(snappy, damaged, 0, 13, -1)
+                Ok(_)  => test.fail("the checksum was changed")
+                Err(f) => test.assert_eq_str(avroerror.kind_name(f.kind), "checksum-mismatch")
+            test.case("a payload too short to hold the trailer")
+            match avrocodec.decompress(snappy, packed, 0, 3, -1)
+                Ok(_)  => test.fail("three bytes cannot hold a trailer")
+                Err(f) => test.assert(avroerror.is_incomplete(f.kind))
+            test.case("a size over the limit is refused before anything is decompressed")
+            match avrocodec.decompress(snappy, packed, 0, 13, 5)
+                Ok(_)  => test.fail("nine bytes is over five")
+                Err(f) => test.assert(avroerror.is_limit(f.kind))
+    for (sized, what) in [(liar_size, "a size it does not deliver"), (broken_size, "no size")]
+        test.case(what)
+        let Ok(c) = avrocodec.reader_codec("zstandard", sized, copy_run) else
+            return test.fail("zstandard is a legal codec name")
+        match avrocodec.decompress(c, data, 0, 9, -1)
+            Ok(_)  => test.fail(what)
+            Err(f) => test.assert_eq_str(avroerror.kind_name(f.kind), "bad-parameter")
+        match avrocodec.compress(c, data, 0, 9)
+            Ok(_)  => test.fail("a read-only codec cannot compress")
+            Err(f) => test.assert_eq_str(avroerror.kind_name(f.kind), "bad-parameter")
+        test.assert(avrocodec.can_read([c], "zstandard"))
+        let pack = c.pack
+        test.assert(bytes.len(pack(data, 0, 9)) == 0)
+    test.case("a codec needs a name")
+    match avrocodec.codec("", copy_size, copy_run, copy_run)
+        Ok(_)  => test.fail("the name is empty")
+        Err(f) => test.assert_eq_str(avroerror.kind_name(f.kind), "bad-parameter")

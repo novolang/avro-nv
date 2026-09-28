@@ -1,0 +1,294 @@
+// avroresolveedge_tests.nv — every rule resolution refuses a pair by,
+// the plan in words, a recursive type, and the logical types and the
+// fingerprints at their edges.
+
+use std.test
+use std.bytes
+use avrobinary
+use avroerror
+use avrofp
+use avrological
+use avroresolve
+use avroschema
+use avrovalue
+
+// A schema from its JSON text.
+fn schema(text: Str) -> AvroSchema
+    match avroschema.parse(text)
+        Ok(s)  => s
+        Err(_) => avroschema.primitive(AvroNull)
+
+// The plan for two schemas, or the fault's kind name.
+fn outcome(w: Str, r: Str) -> Str
+    match avroresolve.resolve(schema(w), schema(r))
+        Ok(_)  => "ok"
+        Err(f) => avroerror.kind_name(f.kind)
+
+// A writer's schema, a reader's, and what resolution answers.
+fn pairs() -> [(Str, Str, Str)]
+    [("\"long\"", "\"int\"", "no-resolution"),
+     ("\"string\"", "\"int\"", "no-resolution"),
+     ("\"int\"", "[\"null\",\"string\"]", "no-resolution"),
+     ("[\"int\",\"string\"]", "[\"null\",\"int\"]", "no-resolution"),
+     ("[\"int\",\"string\"]", "\"int\"", "no-resolution"),
+     ("{\"type\":\"record\",\"name\":\"A\",\"fields\":[]}", "{\"type\":\"record\",\"name\":\"B\",\"fields\":[]}",
+      "no-resolution"),
+     ("{\"type\":\"record\",\"name\":\"A\",\"fields\":[]}",
+      "{\"type\":\"record\",\"name\":\"B\",\"aliases\":[\"A\"],\"fields\":[]}", "ok"),
+     ("{\"type\":\"record\",\"name\":\"A\",\"aliases\":[\"B\"],\"fields\":[]}",
+      "{\"type\":\"record\",\"name\":\"B\",\"fields\":[]}", "no-resolution"),
+     ("{\"type\":\"record\",\"name\":\"A\",\"fields\":[]}",
+      "{\"type\":\"record\",\"name\":\"A\",\"fields\":[{\"name\":\"x\",\"type\":\"int\"}]}", "missing-field-no-default"),
+     ("{\"type\":\"record\",\"name\":\"A\",\"fields\":[{\"name\":\"x\",\"type\":\"string\"}]}",
+      "{\"type\":\"record\",\"name\":\"A\",\"fields\":[{\"name\":\"x\",\"type\":\"int\"}]}", "no-resolution"),
+     ("{\"type\":\"fixed\",\"name\":\"F\",\"size\":2}",
+        "{\"type\":\"fixed\",\"name\":\"F\",\"size\":3}",
+        "no-resolution"),
+     ("{\"type\":\"fixed\",\"name\":\"F\",\"size\":2}",
+        "{\"type\":\"fixed\",\"name\":\"F\",\"size\":2}",
+        "ok"),
+     ("{\"type\":\"enum\",\"name\":\"E\",\"symbols\":[\"A\",\"B\"]}", "{\"type\":\"enum\",\"name\":\"E\",\"symbols\":[\"A\"]}",
+      "no-resolution"),
+     ("{\"type\":\"map\",\"values\":\"long\"}",
+        "{\"type\":\"map\",\"values\":\"int\"}",
+        "no-resolution"),
+     ("\"boolean\"", "\"boolean\"", "ok"), ("\"null\"", "\"null\"", "ok")]
+
+@test
+fn test_every_rule_refuses_the_pairs_it_should() [io]
+    for (w, r, want) in pairs()
+        test.case("${w} as ${r}")
+        test.assert_eq_str(outcome(w, r), want)
+        test.assert(avroresolve.resolves(schema(w), schema(r)) == (want == "ok"))
+
+// A writer's schema, a reader's, and the sentence `describe` answers.
+fn changes() -> [(Str, Str, Str)]
+    [("\"int\"", "\"int\"", "The reader reads the writer's data unchanged."),
+     ("\"int\"", "\"long\"", "`long` is promoted from int to long."),
+     ("\"int\"", "[\"null\",\"long\"]",
+      "At `union` the writer's int is read as branch 1 of the reader's union. `union` is promoted from int to long."),
+     ("[\"null\",\"string\"]", "[\"string\",\"null\"]",
+      "The writer's branch 0 of the union at `union` is read as the reader's branch 1. The writer's branch 1 of the union at `union` is read as the reader's branch 0."),
+     ("{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"a\",\"type\":\"int\"},{\"name\":\"gone\",\"type\":\"string\"},{\"name\":\"xs\",\"type\":{\"type\":\"array\",\"items\":\"int\"}}]}",
+      "{\"type\":\"record\",\"name\":\"R2\",\"aliases\":[\"R\"],\"fields\":[{\"name\":\"b\",\"type\":\"long\",\"aliases\":[\"a\"]},{\"name\":\"xs\",\"type\":{\"type\":\"array\",\"items\":\"double\"}},{\"name\":\"n\",\"type\":\"int\",\"default\":0}]}",
+      "The writer's `R` is read as the reader's `R2`. Field `R2.a` is read into field `b`. `R2.b` is promoted from int to long. Field `R2.gone` is only in the writer's schema, and is skipped. `R2.xs[]` is promoted from int to double. Field `R2.n` is only in the reader's schema, and is filled from its default."),
+     ("{\"type\":\"enum\",\"name\":\"E\",\"symbols\":[\"A\",\"B\"]}",
+      "{\"type\":\"enum\",\"name\":\"E\",\"symbols\":[\"A\"],\"default\":\"A\"}",
+      "Symbol `B` of `E` is not in the reader's enum, and reads as `A`."),
+     ("{\"type\":\"map\",\"values\":\"float\"}", "{\"type\":\"map\",\"values\":\"double\"}",
+      "`map[]` is promoted from float to double.")]
+
+@test
+fn test_describe_says_what_a_change_does() [io]
+    for (w, r, want) in changes()
+        test.case("${w} as ${r}")
+        match avroresolve.resolve(schema(w), schema(r))
+            Err(e) => test.fail(e.message())
+            Ok(p)  =>
+                test.assert_eq_str(avroresolve.describe(p), want)
+                test.assert(avroresolve.is_identity(p) == (w == r))
+
+@test
+fn test_is_identity_is_false_for_every_kind_of_change() [io]
+    let same_enum = "{\"type\":\"enum\",\"name\":\"E\",\"symbols\":[\"A\",\"B\"]}"
+    let same_record = "{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"a\",\"type\":\"int\"}]}"
+    for (w, r) in [(same_enum, "{\"type\":\"enum\",\"name\":\"E\",\"symbols\":[\"B\",\"A\"]}"),
+                   (same_enum, "{\"type\":\"enum\",\"name\":\"E\",\"symbols\":[\"A\",\"B\",\"C\"]}"),
+                   (same_record,
+    "{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"z\",\"type\":\"int\",\"default\":1},{\"name\":\"a\",\"type\":\"int\"}]}"),
+                   (same_record,
+    "{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"a\",\"type\":\"int\"},{\"name\":\"z\",\"type\":\"int\",\"default\":1}]}"),
+                   (same_record,
+    "{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"a\",\"type\":\"long\"}]}"),
+                   ("[\"null\",\"int\"]", "[\"null\",\"int\",\"string\"]"),
+                   ("[\"null\",\"int\"]", "[\"null\",\"long\"]"),
+                   ("{\"type\":\"array\",\"items\":\"int\"}", "{\"type\":\"array\",\"items\":\"long\"}")]
+        test.case("${w} as ${r}")
+        match avroresolve.resolve(schema(w), schema(r))
+            Err(e) => test.fail(e.message())
+            Ok(p)  => test.assert(not avroresolve.is_identity(p))
+    for text in [same_enum, same_record, "[\"null\",\"int\"]", "{\"type\":\"map\",\"values\":\"int\"}"]
+        match avroresolve.resolve(schema(text), schema(text))
+            Err(e) => test.fail(e.message())
+            Ok(p)  => test.assert(avroresolve.is_identity(p))
+
+@test
+fn test_a_recursive_type_resolves_and_decodes_to_any_depth() [io]
+    let w = schema("{\"type\":\"record\",\"name\":\"L\",\"fields\":[{\"name\":\"v\",\"type\":\"int\"},{\"name\":\"next\",\"type\":[\"null\",\"L\"]}]}")
+    let r = schema("{\"type\":\"record\",\"name\":\"L\",\"fields\":[{\"name\":\"next\",\"type\":[\"null\",\"L\"]},{\"name\":\"v\",\"type\":\"long\"}]}")
+    let list3 = bytes.from_byte_list([2, 2, 4, 2, 6, 0])
+    match avroresolve.resolve(w, r)
+        Err(e) => test.fail(e.message())
+        Ok(p)  =>
+            test.assert(not avroresolve.is_identity(p))
+            match avroresolve.decode(list3, 0, p, avrobinary.default_limits())
+                Err(e) => test.fail(e.message())
+                Ok(v)  =>
+                    match avrovalue.to_json(v, r)
+                        Ok(j)  => test.assert_eq_str(j,
+                            "{\"next\":{\"L\":{\"next\":{\"L\":{\"next\":null,\"v\":3}},\"v\":2}},\"v\":1}")
+                        Err(e) => test.fail(e.message())
+            test.case("the depth limit holds on a resolved decode too")
+            let shallow = AvroLimits { max_length: -1, max_items: -1, max_depth: 2 }
+            match avroresolve.decode(list3, 0, p, shallow)
+                Ok(_)  => test.fail("three links are deeper than two levels")
+                Err(f) => test.assert(avroerror.is_limit(f.kind))
+    match avroresolve.resolve(w, w)
+        Err(e) => test.fail(e.message())
+        Ok(p)  =>
+            test.assert(avroresolve.is_identity(p))
+            test.assert_eq_str(avroresolve.describe(p), "The reader reads the writer's data unchanged.")
+
+// A writer's schema, a reader's, input in hexadecimal, and the fault
+// kind a resolved decode answers.
+fn damaged() -> [(Str, Str, Str, Str)]
+    [("[\"null\",\"int\"]", "[\"null\",\"long\"]", "04", "bad-union-index"),
+     ("[\"null\",\"int\"]", "[\"null\",\"long\"]", "", "truncated"),
+     ("[\"null\",\"int\"]", "[\"null\",\"long\"]", "02", "truncated"),
+     ("\"int\"", "[\"null\",\"long\"]", "", "truncated"),
+     ("{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"a\",\"type\":\"int\"},{\"name\":\"b\",\"type\":\"int\"}]}",
+      "{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"b\",\"type\":\"int\"}]}", "", "truncated"),
+     ("{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"a\",\"type\":\"int\"}]}",
+      "{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"a\",\"type\":\"long\"}]}", "", "truncated"),
+     ("{\"type\":\"enum\",\"name\":\"E\",\"symbols\":[\"A\"]}", "{\"type\":\"enum\",\"name\":\"E\",\"symbols\":[\"A\"]}",
+      "04", "bad-enum-index"),
+     ("{\"type\":\"array\",\"items\":\"int\"}",
+        "{\"type\":\"array\",\"items\":\"long\"}",
+        "",
+        "truncated"),
+     ("{\"type\":\"array\",\"items\":\"int\"}",
+        "{\"type\":\"array\",\"items\":\"long\"}",
+        "02",
+        "truncated"),
+     ("{\"type\":\"array\",\"items\":\"int\"}",
+        "{\"type\":\"array\",\"items\":\"long\"}",
+        "0400",
+        "length-limit-reached"),
+     ("{\"type\":\"map\",\"values\":\"int\"}",
+        "{\"type\":\"map\",\"values\":\"long\"}",
+        "0280",
+        "truncated"),
+     ("\"string\"", "\"bytes\"", "02", "truncated")]
+
+@test
+fn test_a_resolved_decode_names_every_fault() [io]
+    let tight = AvroLimits { max_length: 8, max_items: 1, max_depth: 8 }
+    for (w, r, hex, kind) in damaged()
+        test.case("${hex} from ${w} as ${r}")
+        match avroresolve.resolve(schema(w), schema(r))
+            Err(e) => test.fail(e.message())
+            Ok(p)  =>
+                match avroresolve.decode(bytes.from_hex(hex) ?? bytes.zeros(0), 0, p, tight)
+                    Ok(_)  => test.fail("the input is damaged")
+                    Err(f) => test.assert_eq_str(avroerror.kind_name(f.kind), kind)
+
+@test
+fn test_a_map_and_a_union_inside_a_record_read_through_a_plan() [io]
+    let w = schema("{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"m\",\"type\":{\"type\":\"map\",\"values\":\"int\"}},{\"name\":\"u\",\"type\":[\"null\",\"string\"]}]}")
+    let r = schema("{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"m\",\"type\":{\"type\":\"map\",\"values\":\"double\"}},{\"name\":\"u\",\"type\":[\"null\",\"bytes\"]}]}")
+    match avroresolve.resolve(w, r)
+        Err(e) => test.fail(e.message())
+        Ok(p)  =>
+            match avroresolve.decode(bytes.from_hex("010602610600020278") ?? bytes.zeros(0),
+                0,
+                p,
+                avrobinary.default_limits())
+                Err(e) => test.fail(e.message())
+                Ok(v)  =>
+                    match avrovalue.to_json(v, r)
+                        Ok(j)  => test.assert_eq_str(j, "{\"m\":{\"a\":3.0},\"u\":{\"bytes\":\"x\"}}")
+                        Err(e) => test.fail(e.message())
+
+@test
+fn test_the_logical_types_at_their_edges() [io]
+    test.case("every name")
+    let names = ["time-millis", "time-micros", "timestamp-millis", "timestamp-micros", "timestamp-nanos",
+                 "local-timestamp-millis", "local-timestamp-micros", "local-timestamp-nanos", "duration"]
+    for l in [AvroTimeMillis, AvroTimeMicros, AvroTimestampMillis, AvroTimestampMicros, AvroTimestampNanos,
+              AvroLocalTimestampMillis, AvroLocalTimestampMicros, AvroLocalTimestampNanos, AvroDuration]
+        test.assert(list.contains(names, avrological.logical_name(l)))
+    test.assert_eq_str(avroschema.type_name(avrological.underlying(AvroNotLogical)), "null")
+    test.assert_eq_str(avroschema.type_name(avrological.underlying(AvroDecimal)), "bytes")
+    test.assert_eq_str(avroschema.type_name(avrological.underlying(AvroTimeMillis)), "int")
+    test.assert(avrological.fits(AvroNotLogical, schema("\"null\"")))
+
+    test.case("which annotations fit")
+    for (text, want) in [("{\"type\":\"bytes\",\"logicalType\":\"decimal\",\"precision\":4,\"scale\":2}", "decimal"),
+                         ("{\"type\":\"bytes\",\"logicalType\":\"decimal\",\"precision\":0}", ""),
+                         ("{\"type\":\"bytes\",\"logicalType\":\"decimal\",\"precision\":2,\"scale\":3}", ""),
+                         ("{\"type\":\"fixed\",\"name\":\"D\",\"size\":2,\"logicalType\":\"decimal\",\"precision\":4}",
+    "decimal"),
+                         ("{\"type\":\"fixed\",\"name\":\"D\",\"size\":2,\"logicalType\":\"decimal\",\"precision\":5}", ""),
+                         ("{\"type\":\"string\",\"logicalType\":\"decimal\",\"precision\":5}", ""),
+                         ("{\"type\":\"fixed\",\"name\":\"U\",\"size\":16,\"logicalType\":\"uuid\"}", "uuid"),
+                         ("{\"type\":\"fixed\",\"name\":\"U\",\"size\":15,\"logicalType\":\"uuid\"}", ""),
+                         ("{\"type\":\"fixed\",\"name\":\"T\",\"size\":12,\"logicalType\":\"duration\"}", "duration"),
+                         ("{\"type\":\"fixed\",\"name\":\"T\",\"size\":8,\"logicalType\":\"duration\"}", ""),
+                         ("{\"type\":\"long\",\"logicalType\":\"timestamp-nanos\"}", "timestamp-nanos"),
+                         ("{\"type\":\"int\",\"logicalType\":\"time-micros\"}", ""),
+                         ("{\"type\":\"int\",\"logicalType\":\"soon\"}", ""), ("\"int\"", "")]
+        test.case(text)
+        let s = schema(text)
+        test.assert_eq_str(avrological.logical_name(avrological.of(s)), want)
+        match avrological.check(s)
+            Ok(l)  => test.assert_eq_str(avrological.logical_name(l), want)
+            Err(f) =>
+                test.assert(want == "")
+                test.assert_eq_str(avroerror.kind_name(f.kind), "bad-logical-type")
+
+    test.case("decimals of every width, and the ones too wide")
+    for n in [0, 1, -1, 127, 128, -128, -129, 9223372036854775807, -9223372036854775807 - 1]
+        match avrological.decimal_bytes(n)
+            Err(e) => test.fail(e.message())
+            Ok(b)  =>
+                match avrological.decimal_unscaled(b)
+                    Ok(m)  => test.assert(m == n)
+                    Err(e) => test.fail(e.message())
+    match avrological.decimal_bytes(128)
+        Ok(b)  => test.assert(bytes.len(b) == 2)
+        Err(e) => test.fail(e.message())
+    for (hex, want) in [("", 0), ("00000000000000000001", 1), ("ffffffffffffffffffff", -1)]
+        match avrological.decimal_unscaled(bytes.from_hex(hex) ?? bytes.zeros(0))
+            Ok(m)  => test.assert(m == want)
+            Err(e) => test.fail(e.message())
+    for hex in ["010000000000000000", "008000000000000000", "ff7fffffffffffffff"]
+        match avrological.decimal_unscaled(bytes.from_hex(hex) ?? bytes.zeros(1))
+            Ok(_)  => test.fail("${hex} does not fit 64 bits")
+            Err(f) => test.assert(avroerror.is_limit(f.kind))
+
+    test.case("a duration needs twelve bytes and counts that fit 32 bits")
+    match avrological.duration_of(bytes.zeros(11))
+        Ok(_)  => test.fail("eleven bytes are not a duration")
+        Err(f) => test.assert(avroerror.is_limit(f.kind))
+    match avrological.duration_bytes(0, 4294967296, 0)
+        Ok(_)  => test.fail("2^32 does not fit 32 bits")
+        Err(f) => test.assert_eq_str(avroerror.kind_name(f.kind), "bad-parameter")
+
+@test
+fn test_the_fingerprints_at_their_edges() [io]
+    test.case("a schema found by its fingerprint")
+    let s = schema("\"string\"")
+    let known = [schema("\"int\""), s]
+    match avrofp.schema_for(avrofp.AVRO_RABIN_CHECK_STRING, known)
+        Ok(found) => test.assert_eq_str(avroschema.type_name(found.kind), "string")
+        Err(e)    => test.fail(e.message())
+    match avrofp.schema_for(1, known)
+        Ok(_)  => test.fail("no schema has the fingerprint 1")
+        Err(f) => test.assert(avroerror.describe(f) == "no schema offered has the fingerprint 0000000000000001")
+    test.case("a prefix read back, and one cut short")
+    let prefix = avrofp.single_object_prefix(s)
+    test.assert(avrofp.is_single_object(prefix, 0))
+    match avrofp.read_single_object_prefix(prefix + bytes.zeros(1), 0)
+        Ok(p)  => test.assert(p.fingerprint == avrofp.AVRO_RABIN_CHECK_STRING and p.datum_at == 10)
+        Err(e) => test.fail(e.message())
+    for n in [1, 9]
+        match avrofp.read_single_object_prefix(bytes.slice(prefix, 0, n), 0)
+            Ok(_)  => test.fail("the prefix is cut short")
+            Err(f) => test.assert(avroerror.is_incomplete(f.kind))
+    test.case("the table's last entry, and an index below it")
+    match avrofp.rabin_table_entry(255)
+        Ok(v)  => test.assert(v != 0)
+        Err(e) => test.fail(e.message())
+    match avrofp.rabin_table_entry(-1)
+        Ok(_)  => test.fail("-1 is outside the table")
+        Err(f) => test.assert_eq_str(avroerror.kind_name(f.kind), "bad-parameter")

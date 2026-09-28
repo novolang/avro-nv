@@ -1,44 +1,33 @@
 // avrofp.nv — schema fingerprints, and the single-object encoding they
 // make possible.
 //
-// Every body is a `todo()`.  The signatures are the design, and the
-// compiler checks them as claims; see the README for the stamp.
+// A fingerprint is a hash of a schema's Parsing Canonical Form, and it
+// is how a stream of records says which schema each was written with
+// without repeating the schema (specification section "Schema
+// Fingerprints").  A container file puts the schema in its header once.
+// A message queue, where each record is its own message, cannot, so
+// the specification defines a single-object encoding: the two marker
+// bytes `C3 01`, the eight-byte fingerprint, and then the record's
+// ordinary binary encoding.
 //
-// A FINGERPRINT IS A HASH OF THE PARSING CANONICAL FORM, and it is how
-// a stream of Avro records says which schema each one was written with
-// without repeating the schema.  A container file puts the schema in
-// its header once and is done; a message queue, where each record is
-// its own message, cannot — so the specification defines a
-// SINGLE-OBJECT ENCODING: two marker bytes `C3 01`, an eight-byte
-// fingerprint, and then the record's ordinary binary encoding.
+// The default fingerprint is CRC-64-AVRO, which is not a standard
+// CRC-64.  It is a 64-bit Rabin fingerprint whose polynomial and
+// initial value are both `0xC15D213AA4D7A795`, folded eight bits at a
+// time.  CRC-64/ECMA-182 and CRC-64/XZ give different answers, and the
+// specification's two check values below settle which one a port
+// computed.
 //
-// THE DEFAULT FINGERPRINT IS CRC-64-AVRO, and it is NOT a standard
-// CRC-64.  The specification defines it as a 64-bit Rabin fingerprint
-// with the polynomial constant `0xC15D213AA4D7A795`, initialised to
-// `0xC15D213AA4D7A795` and folded eight bits at a time — different
-// initialisation, different table, different answer from
-// CRC-64/ECMA-182 and from CRC-64/XZ.  A port that reached for a CRC-64
-// it already had would produce fingerprints no other Avro reader
-// recognises, and the two check values below are what settle it.
-//
-// MD5 AND SHA-256 ARE ALSO DEFINED, for a caller that wants a wider
-// one.  Both are over the same canonical form.  Only CRC-64-AVRO fits
-// the single-object encoding's eight bytes.
-//
-// AND THE FINGERPRINT FUNCTIONS ARE VALUES TOO, for the same reason
-// the codecs are: MD5 and SHA-256 belong to crypto-nv, and a caller
-// that only ever uses CRC-64-AVRO — which is every caller doing
-// single-object encoding — should not resolve a hash package to get
-// it.  `rabin` is built in; `md5_of` and `sha256_of` take the digest
-// function.
+// MD5 and SHA-256 fingerprints are defined over the same canonical
+// form.  They belong to crypto-nv, so `wide_fingerprint` takes the
+// digest as a named function, the same shape the codecs take.  Only
+// CRC-64-AVRO fits the single-object encoding's eight bytes.
 
+use std.bytes
 use avroerror
 use avroschema
 
-// The two bytes a single-object encoding starts with: `0xC3`, `0x01`.
-//
-// `0xC3` is not a legal first byte of any Avro datum whose schema is a
-// primitive, which is what makes the marker recognisable.
+// The bytes of a single-object encoding's marker, `0xC3` then `0x01`:
+// 2.
 pub const AVRO_SINGLE_OBJECT_MARKER_BYTES = 2
 
 // How many bytes a single-object encoding's fingerprint occupies: 8.
@@ -49,29 +38,32 @@ pub const AVRO_SINGLE_OBJECT_PREFIX_BYTES = 10
 
 // The CRC-64-AVRO polynomial constant: `0xC15D213AA4D7A795`.
 //
-// Used both as the polynomial and as the INITIAL value, which is the
-// part that makes this not any standard CRC-64.
+// It is both the polynomial and the initial value.
 pub const AVRO_RABIN_CONSTANT = 0xC15D213AA4D7A795
 
-// The fingerprint of the canonical form `"\"null\""`:
-// `0x63DD24E7CC258F8A`.
+// The fingerprint of the canonical form `"null"`: `0x63DD24E7CC258F8A`.
 //
-// The specification's own worked example, and the one number that
-// settles whether an implementation is CRC-64-AVRO or some other
-// CRC-64.
+// The specification's own worked example.
 pub const AVRO_RABIN_CHECK_NULL = 0x63DD24E7CC258F8A
 
-// The fingerprint of the canonical form `"\"string\""`:
+// The fingerprint of the canonical form `"string"`:
 // `0x8F014872634503C7`.
 //
 // The specification's second worked example.
 pub const AVRO_RABIN_CHECK_STRING = 0x8F014872634503C7
 
+// Entry `i` of the Rabin table, for `i` from 0 to 255.
+fn table_entry(i: Int) -> Int
+    var fp = i
+    for _ in 0..8
+        fp = bits.shr(fp, 1) ^ (AVRO_RABIN_CONSTANT & (0 - (fp & 1)))
+    fp
+
 // The CRC-64-AVRO Rabin fingerprint of a canonical form.
 //
-// Takes the TEXT and not a schema, so a caller that already has a
-// canonical form — from a schema registry, from a file's metadata —
-// does not re-parse a schema to hash it.
+// It takes the text and not a schema, so a caller that already has a
+// canonical form, from a registry or a file's metadata, does not parse
+// a schema to hash it.  The text is hashed as its UTF-8 bytes.
 //
 // ```novo
 // use avrofp
@@ -81,7 +73,10 @@ pub const AVRO_RABIN_CHECK_STRING = 0x8F014872634503C7
 //     println("${fp}")
 // ```
 pub fn rabin(canonical: Str) -> Int []
-    todo("avro-nv.avrofp.rabin")
+    var fp = AVRO_RABIN_CONSTANT
+    for i in 0..str.len(canonical)
+        fp = bits.shr(fp, 8) ^ table_entry((fp ^ str.byte_at_or(canonical, i, 0)) & 0xFF)
+    fp
 
 // The CRC-64-AVRO fingerprint of a schema: `rabin` of its canonical
 // form.
@@ -96,15 +91,13 @@ pub fn rabin(canonical: Str) -> Int []
 //         Err(e) => println(e.message())
 // ```
 pub fn fingerprint(s: AvroSchema) -> Int []
-    todo("avro-nv.avrofp.fingerprint")
+    rabin(avroschema.canonical_form(s))
 
 // One entry of the 256-entry Rabin table.
 //
-// Published one entry at a time, so a build can compute the two
-// kilobytes into memory at start-up or bake them into read-only
-// storage, and neither choice is forced by the signature.
-//
-// `AvroBadParameter` outside `0` ..= `255`.
+// It is published one entry at a time, so a build can compute the
+// table at start-up or place it in read-only storage.
+// `AvroBadParameter` outside 0 to 255.
 //
 // ```novo
 // use avrofp
@@ -115,14 +108,13 @@ pub fn fingerprint(s: AvroSchema) -> Int []
 //         Err(e) => println(e.message())
 // ```
 pub fn rabin_table_entry(i: Int) -> Result<Int, AvroFault> []
-    todo("avro-nv.avrofp.rabin_table_entry")
+    if i < 0 or i > 255
+        return Err(avroerror.fault(AvroBadParameter("a Rabin table index is from 0 to 255"),
+                                   avroerror.at_path("")))
+    Ok(table_entry(i))
 
-// A fingerprint's eight bytes, LITTLE-endian, as a single-object
+// A fingerprint's eight bytes, little-endian, as a single-object
 // encoding carries them.
-//
-// Little-endian, which is the opposite of what a reader who assumed
-// network order would write, and the mistake that makes a producer's
-// messages unreadable by every consumer.
 //
 // ```novo
 // use std.bytes
@@ -132,9 +124,9 @@ pub fn rabin_table_entry(i: Int) -> Result<Int, AvroFault> []
 //     println("${bytes.len(avrofp.fingerprint_bytes(0))}")
 // ```
 pub fn fingerprint_bytes(fp: Int) -> Bytes []
-    todo("avro-nv.avrofp.fingerprint_bytes")
+    bytes.u64_le(fp)
 
-// A fingerprint from the eight bytes at `off`.
+// A fingerprint from the eight little-endian bytes at `off`.
 //
 // `AvroBufferTooSmall` for fewer than eight bytes from there.
 //
@@ -148,15 +140,17 @@ pub fn fingerprint_bytes(fp: Int) -> Bytes []
 //         Err(e) => println(e.message())
 // ```
 pub fn fingerprint_from(src: Bytes, off: Int) -> Result<Int, AvroFault> []
-    todo("avro-nv.avrofp.fingerprint_from")
+    let have = bytes.len(src) - off
+    if off < 0 or have < AVRO_FINGERPRINT_BYTES
+        return Err(avroerror.fault(AvroBufferTooSmall(AVRO_FINGERPRINT_BYTES, math.max(have, 0)),
+                                   avroerror.at_offset(-1, off)))
+    Ok(bytes.u64_le_at(src, off) ?? 0)
 
 // A wider fingerprint, through a digest function the caller supplies.
 //
 // The specification defines MD5 and SHA-256 fingerprints over the same
-// canonical form.  Both belong to crypto-nv, and a caller that only
-// ever uses CRC-64-AVRO — which is every caller doing single-object
-// encoding — should not resolve a hash package to get it.  So the
-// digest arrives as a NAMED FUNCTION, the same shape the codecs take.
+// canonical form.  The digest is handed the canonical form's UTF-8
+// bytes.
 //
 // ```novo
 // use std.bytes
@@ -172,11 +166,10 @@ pub fn fingerprint_from(src: Bytes, off: Int) -> Result<Int, AvroFault> []
 //         Err(e) => println(e.message())
 // ```
 pub fn wide_fingerprint(s: AvroSchema, digest: fn(Bytes) -> Bytes) -> Bytes []
-    todo("avro-nv.avrofp.wide_fingerprint")
+    digest(bytes.from_str(avroschema.canonical_form(s)))
 
-// The ten-byte prefix a single-object encoding starts with.
-//
-// `C3 01` and then the fingerprint, little-endian.
+// The ten-byte prefix a single-object encoding starts with: `C3 01`
+// and then the fingerprint, little-endian.
 //
 // ```novo
 // use std.bytes
@@ -189,12 +182,10 @@ pub fn wide_fingerprint(s: AvroSchema, digest: fn(Bytes) -> Bytes) -> Bytes []
 //         Err(e) => println(e.message())
 // ```
 pub fn single_object_prefix(s: AvroSchema) -> Bytes []
-    todo("avro-nv.avrofp.single_object_prefix")
+    bytes.from_byte_list([0xC3, 0x01]) + fingerprint_bytes(fingerprint(s))
 
-// Whether `src` at `off` begins a single-object encoding.
-//
-// The two marker bytes, and nothing else.  The cheap check a consumer
-// makes before it looks up a fingerprint.
+// Whether `src` at `off` begins with the two marker bytes of a
+// single-object encoding.
 //
 // ```novo
 // use std.bytes
@@ -204,12 +195,10 @@ pub fn single_object_prefix(s: AvroSchema) -> Bytes []
 //     println("${avrofp.is_single_object(bytes.zeros(10), 0)}")
 // ```
 pub fn is_single_object(src: Bytes, off: Int) -> Bool []
-    todo("avro-nv.avrofp.is_single_object")
+    (bytes.byte_at(src, off) ?? -1) == 0xC3 and (bytes.byte_at(src, off + 1) ?? -1) == 0x01
 
 // The fingerprint a single-object encoding names, and where its datum
 // starts.
-//
-// `AvroBadSingleObjectMarker` when the two marker bytes are wrong.
 //
 // ```novo
 // use std.bytes
@@ -228,6 +217,9 @@ pub struct AvroSingleObject
 
 // Read a single-object encoding's prefix.
 //
+// `AvroBadSingleObjectMarker` when the two marker bytes are wrong, and
+// `AvroTruncated` when the input ends inside the prefix.
+//
 // ```novo
 // use std.bytes
 // use avrofp
@@ -238,17 +230,22 @@ pub struct AvroSingleObject
 //         Err(e) => println(e.message())
 // ```
 pub fn read_single_object_prefix(src: Bytes, off: Int) -> Result<AvroSingleObject, AvroFault> []
-    todo("avro-nv.avrofp.read_single_object_prefix")
+    let at = avroerror.at_offset(-1, off)
+    if bytes.len(src) - off < AVRO_SINGLE_OBJECT_MARKER_BYTES
+        return Err(avroerror.fault(AvroTruncated, at))
+    if not is_single_object(src, off)
+        return Err(avroerror.fault(AvroBadSingleObjectMarker, at))
+    match fingerprint_from(src, off + AVRO_SINGLE_OBJECT_MARKER_BYTES)
+        Err(_) => Err(avroerror.fault(AvroTruncated, at))
+        Ok(fp) => Ok(AvroSingleObject { fingerprint: fp, datum_at: off + AVRO_SINGLE_OBJECT_PREFIX_BYTES })
 
-// The schema among those offered whose fingerprint matches, or a
-// fault naming the one that was asked for.
+// The schema among those offered whose fingerprint matches, or a fault
+// naming the one asked for.
 //
-// `AvroUnknownFingerprint` carrying the fingerprint in hexadecimal —
-// which `avroerror.is_unsupported` answers true for, because the
-// message is fine and the CALLER is missing a schema.  That is the
-// signal a consumer turns into "fetch this schema from the registry
-// and retry", and it is the whole operational loop single-object
-// encoding exists to support.
+// `AvroUnknownFingerprint` carries the fingerprint as sixteen
+// hexadecimal digits, most significant first.
+// `avroerror.is_unsupported` answers true for it: the message is fine,
+// and the caller is missing a schema, which it can fetch and offer.
 //
 // ```novo
 // use avrofp
@@ -260,4 +257,7 @@ pub fn read_single_object_prefix(src: Bytes, off: Int) -> Result<AvroSingleObjec
 //         Err(e) => println(e.message())
 // ```
 pub fn schema_for(fp: Int, known: [AvroSchema]) -> Result<AvroSchema, AvroFault> []
-    todo("avro-nv.avrofp.schema_for")
+    for s in known
+        if fingerprint(s) == fp
+            return Ok(s)
+    Err(avroerror.fault(AvroUnknownFingerprint(bytes.to_hex(bytes.u64_be(fp))), avroerror.at_path("")))
