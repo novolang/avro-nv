@@ -268,7 +268,9 @@ independent implementations: the Apache Avro project's Python library,
 version 1.11.3, and fastavro, version 1.12.2. It checks the Parsing Canonical
 Form and the CRC-64-AVRO fingerprint of 17 schemas, the binary encoding of
 72 datums both ways, 80 datums read through a different reader schema, and 9
-container files read record for record.
+container files read record for record. A `bytes` or `fixed` datum draws every
+byte value from 0 to 255, zero included, so the JSON encoding is checked with
+`\u0000` in its strings.
 
 The specification's own check values are asserted in
 `tests/avroresolve_tests.nv`: `0x63DD24E7CC258F8A` for `"null"` and

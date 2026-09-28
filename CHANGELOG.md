@@ -32,7 +32,9 @@ The first implementation of the interface published as 0.0.1.
 - `tests/differential_tests.nv`, written by `tools/differential.py`,
   checks canonical forms, fingerprints, datums, resolved datums and
   container files against the Apache Avro Python library 1.11.3 and
-  fastavro 1.12.2.
+  fastavro 1.12.2.  A `bytes` or `fixed` datum draws every byte value,
+  zero included, so the JSON encoding is checked with `\u0000` in its
+  strings.
 
 ### Changed
 

@@ -159,10 +159,8 @@ def schema_of(text):
 def gen(s, rng, depth):
     """A random datum of a schema, as the Python library represents it.
 
-    No `bytes` or `fixed` value holds a zero byte: std.json ends a
-    string at U+0000, so such a value cannot pass through Avro's JSON
-    encoding in this package yet.  The suites cover zero bytes in the
-    binary encoding on their own.
+    A `bytes` or `fixed` value draws every byte from 0 to 255, so zero
+    bytes pass through Avro's JSON encoding as `\\u0000`.
     """
     t = s.type
     if t == 'null':
@@ -179,11 +177,11 @@ def gen(s, rng, depth):
     if t == 'double':
         return rng.choice([0.0, -0.5, 1e20, rng.uniform(-1e6, 1e6)])
     if t == 'bytes':
-        return bytes(rng.randrange(1, 256) for _ in range(rng.randint(0, 6)))
+        return bytes(rng.randrange(0, 256) for _ in range(rng.randint(0, 6)))
     if t == 'string':
         return ''.join(rng.choice(['a', 'b', 'é', '✓', ' ', 'Z', '"', '\\']) for _ in range(rng.randint(0, 6)))
     if t == 'fixed':
-        return bytes(rng.randrange(1, 256) for _ in range(s.size))
+        return bytes(rng.randrange(0, 256) for _ in range(s.size))
     if t == 'enum':
         return rng.choice(s.symbols)
     if t == 'array':
