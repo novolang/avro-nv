@@ -26,8 +26,10 @@ category    = "encoding"
 tags        = ["avro", "serialization", "schema", "schema-evolution", "encoding", "big-data", "sans-io"]
 repository  = "https://github.com/novolang/avro-nv"
 maintainers = ["novo-lang"]
-# 0.15.0 is the toolchain this release was built and tested with.
-novo        = ">= 0.15.0"
+# 0.16.0 is the toolchain this release was built and tested with: its
+# `std.json` keeps a string that holds a zero byte, which the
+# differential datums need.
+novo        = ">= 0.16.0"
 
 # A library: no `main`, so `novo pkg build` type-checks and
 # effect-checks every module under `src/` and writes no binary.
